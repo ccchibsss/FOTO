@@ -1,179 +1,206 @@
-# app.py
 import streamlit as st
-from streamlit_cropper import st_cropper
 import os
+import torch
 import numpy as np
 from PIL import Image
-from rembg import remove
-from diffusers import StableDiffusionInpaintPipeline
+import cv2
+import requests
+from pathlib import Path
+
+# --- Настройки ---
+st.set_page_config(page_title="Удаление водяных знаков", layout="wide")
+st.title("🧼 Удаление водяных знаков с изображений")
+
+# Папка для моделей
+models_dir = Path("models")
+models_dir.mkdir(exist_ok=True)
+
+# URLs моделей
+U2NET_URL = "https://github.com/xuebinqin/U-2-Net/releases/download/v1.0.0/u2net.pth"
+LAMA_URL = "https://huggingface.co/aimetis/lama/resolve/main/big-lama/models/best.ckpt"
+
+U2NET_PATH = models_dir / "u2net.pth"
+LAMA_PATH = models_dir / "lama.pth"  # переименовываем .ckpt → .pth
+
+# --- Функция: скачать модель ---
+def download_model(url: str, path: Path, name: str):
+    if path.exists():
+        st.info(f"✅ {name} уже загружена.")
+        return True
+
+    st.info(f"📥 Загружаю {name}...")
+    try:
+        with requests.get(url, stream=True) as r:
+            r.raise_for_status()
+            total_size = int(r.headers.get('content-length', 0))
+            with open(path, 'wb') as f, st.spinner(f"Скачивание {name}..."):
+                downloaded = 0
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        progress = downloaded / total_size
+                        st.progress(progress)
+        st.success(f"✅ {name} успешно загружена.")
+        return True
+    except Exception as e:
+        st.error(f"❌ Ошибка загрузки {name}: {e}")
+        return False
+
+# --- Скачиваем модели ---
+if not download_model(U2NET_URL, U2NET_PATH, "U2-Net"):
+    st.stop()
+
+if not download_model(LAMA_URL, LAMA_PATH, "LaMa (big-lama)"):
+    st.stop()
+
+# --- Загрузка моделей ---
+@st.cache_resource
+def load_models():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    st.info(f"🔧 Используем устройство: {device}")
+
+    # U2-Net
+    try:
+        import u2net
+        model_u2net = u2net.U2NET(3, 1)
+        model_u2net.load_state_dict(torch.load(U2NET_PATH, map_location=device))
+        model_u2net.to(device).eval()
+    except Exception as e:
+        st.error(f"❌ Ошибка загрузки U2-Net: {e}")
+        return None, device
+
+    # LaMa
+    try:
+        from lama_cleaner.model_manager import ModelManager
+        from lama_cleaner.schema import Config
+        model_lama = ModelManager(name="lama", device=device)
+        config = Config(indoor=False)
+    except Exception as e:
+        st.error(f"❌ Ошибка инициализации LaMa: {e}")
+        return None, device
+
+    return (model_u2net, model_lama, config), device
+
+# --- Загружаем модели ---
+models_data, device = load_models()
+if models_data is None:
+    st.stop()
+
+u2net_model, lama_model, lama_config = models_data
+
+st.success("✅ Все модели загружены и готовы к работе!")
+
+# --- u2net.py (внутри кода!) ---
+# Подключаем реализацию U2NET, если файла нет
+U2NET_CODE = '''
 import torch
-import zipfile
-from io import BytesIO
-from tqdm import tqdm
+import torch.nn as nn
+import torch.nn.functional as F
 
-# Настройки
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
+class REBNCONV(nn.Module):
+    def __init__(self, in_ch=3, out_ch=3, dirate=1):
+        super(REBNCONV, self).__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, 3, padding=1*dirate, dilation=1*dirate)
+        self.bn = nn.BatchNorm2d(out_ch)
+        self.relu = nn.ReLU(inplace=True)
 
-st.set_page_config(page_title="🧹 Удаление фона и водяных знаков", layout="wide")
-st.title("🧹 Массовое удаление фона и водяных знаков")
-st.markdown("Загрузите изображения — удалим фон, затем водяные знаки с помощью ИИ.")
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        return self.relu(x)
 
-# Папки
-os.makedirs("input", exist_ok=True)
-os.makedirs("nobg", exist_ok=True)
-os.makedirs("clean", exist_ok=True)
+def _upsample_like(x, size):
+    return F.interpolate(x, size=size, mode='bilinear', align_corners=False)
 
-# Очистка папок при перезагрузке (по желанию, или оставить для кэша)
-for folder in ["input", "nobg", "clean"]:
-    for f in os.listdir(folder):
-        os.remove(os.path.join(folder, f))
+class U2NET(nn.Module):
+    def __init__(self, in_ch=3, out_ch=1):
+        super(U2NET, self).__init__()
+        self.stage1 = REBNCONV(in_ch, 64)
+        self.pool1 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.stage2 = REBNCONV(64, 64)
+        self.outconv = nn.Conv2d(64, out_ch, 1)
 
-# --- Загрузка ---
-st.subheader("📤 1. Загрузите изображения")
-uploaded_files = st.file_uploader(
-    "Поддержка: JPG, PNG. Можно загрузить ZIP с несколькими файлами.",
-    type=["jpg", "jpeg", "png", "zip"],
-    accept_multiple_files=False  # Загружаем один архив или несколько файлов
-)
+    def forward(self, x):
+        hx = x
+        hx1 = self.stage1(hx)
+        hx = self.pool1(hx1)
+        hx2 = self.stage2(hx)
+        d1 = self.outconv(hx1)
+        return torch.sigmoid(d1),
+'''
 
-image_paths = []
+# Проверим, есть ли u2net.py
+if not os.path.exists("u2net.py"):
+    with open("u2net.py", "w") as f:
+        f.write(U2NET_CODE)
+    st.info("📝 Файл `u2net.py` создан автоматически.")
 
-if uploaded_files:
-    with st.spinner("Обработка загрузки..."):
-        if uploaded_files.name.endswith(".zip"):
-            with zipfile.ZipFile(uploaded_files, "r") as z:
-                z.extractall("input")
-            image_paths = [f for f in os.listdir("input") if f.lower().endswith((".png", ".jpg", ".jpeg"))]
-        else:
-            with open(os.path.join("input", uploaded_files.name), "wb") as f:
-                f.write(uploaded_files.getbuffer())
-            image_paths = [uploaded_files.name]
+# Перезагружаем модуль
+import importlib
+import u2net
+importlib.reload(u2net)
 
-    st.success(f"✅ Загружено {len(image_paths)} изображений.")
+# --- Функция сегментации ---
+def segment_watermark(image: Image.Image):
+    img_np = np.array(image)
+    h, w = img_np.shape[:2]
+    img_tensor = torch.from_numpy(img_np.transpose(2, 0, 1)).float().unsqueeze(0) / 255.0
+    img_tensor = img_tensor.to(device)
 
-# --- Удаление фона ---
-if image_paths and st.button("🚀 Удалить фон (все изображения)"):
-    with st.spinner("Удаляем фон... Это может занять время."):
-        for filename in image_paths:
-            input_path = os.path.join("input", filename)
-            output_path = os.path.join("nobg", f"{os.path.splitext(filename)[0]}.png")
+    with torch.no_grad():
+        pred = u2net_model(img_tensor)[0]
+        pred = torch.sigmoid(pred).squeeze().cpu().numpy()
+    
+    mask = (pred * 255).astype(np.uint8)
+    _, binary_mask = cv2.threshold(mask, 128, 255, cv2.THRESH_BINARY)
+    return cv2.resize(binary_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+
+# --- Интерфейс загрузки ---
+uploaded_file = st.file_uploader("📷 Загрузите изображение", type=["png", "jpg", "jpeg"])
+
+if uploaded_file is not None:
+    image = Image.open(uploaded_file).convert("RGB")
+    img_np = np.array(image)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Оригинал")
+        st.image(image, use_column_width=True)
+
+    if st.button("🧹 Удалить водяной знак"):
+        with st.spinner("Обработка..."):
+
+            # Получаем маску
+            mask = segment_watermark(image)
+
+            # Восстановление
             try:
-                img = Image.open(input_path)
-                img_no_bg = remove(img)
-                img_no_bg.save(output_path, "PNG")
+                input_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+                result_bgr = lama_model(image=input_bgr, mask=mask, config=lama_config)
+                result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
+                result_image = Image.fromarray(result_rgb)
+
+                with col2:
+                    st.subheader("Результат")
+                    st.image(result_image, use_column_width=True)
+
+                # Подготовка к скачиванию
+                from io import BytesIO
+                buf = BytesIO()
+                result_image.save(buf, format="PNG")
+                byte_img = buf.getvalue()
+
+                st.download_button(
+                    label="⬇️ Скачать очищенное изображение",
+                    data=byte_img,
+                    file_name=f"cleaned_{uploaded_file.name.split('.')[0]}.png",
+                    mime="image/png"
+                )
+
+                with st.expander("🔍 Показать маску"):
+                    st.image(mask, width=300, caption="Маска водяного знака")
+
             except Exception as e:
-                st.warning(f"Ошибка при обработке {filename}: {e}")
-    st.success("✅ Фон удалён со всех изображений!")
-
-# --- Показать пример ---
-if os.listdir("nobg"):
-    st.subheader("🖼️ 2. Выберите область водяного знака")
-    preview_file = st.selectbox("Выберите изображение для настройки", os.listdir("nobg"))
-    preview_path = os.path.join("nobg", preview_file)
-    preview_img = Image.open(preview_path)
-
-    # Масштабирование для удобства
-    max_size = 600
-    if max(preview_img.size) > max_size:
-        scale = max_size / max(preview_img.size)
-        new_size = (int(preview_img.width * scale), int(preview_img.height * scale))
-        preview_img = preview_img.resize(new_size, Image.LANCZOS)
-
-    # Интерактивное выделение
-    cropped_img = st_cropper(preview_img, realtime_update=True, box_color="#FF0004", aspect_ratio=None)
-    st.write("Нарисуйте прямоугольник вокруг водяного знака.")
-
-    # Конвертация выделения в маску
-    if cropped_img:
-        left, top, right, bottom = st.session_state.get("box", (0, 0, 100, 100))[:4]
-        mask = Image.new("L", preview_img.size, 0)
-        draw = ImageDraw.Draw(mask)
-        draw.rectangle([left, top, right, bottom], fill=255)
-        st.image(mask, caption="Маска для удаления")
-
-# --- Удалить водяные знаки ---
-if os.listdir("nobg") and st.button("🧹 Удалить водяные знаки (все изображения)"):
-    prompt = st.text_input("Промпт для ИИ (описание фона)", "natural background, clean, no text, high quality")
-    with st.spinner("Загружаем модель Stable Diffusion Inpainting..."):
-        try:
-            pipe = StableDiffusionInpaintPipeline.from_pretrained(
-                "runwayml/stable-diffusion-inpainting",
-                torch_dtype=DTYPE
-            ).to(DEVICE)
-            st.info("Модель загружена. Начинаем обработку...")
-        except Exception as e:
-            st.error(f"Ошибка загрузки модели: {e}")
-            st.stop()
-
-    # Прогресс
-    progress_bar = st.progress(0)
-    for i, filename in enumerate(os.listdir("nobg")):
-        if not filename.lower().endswith(".png"):
-            continue
-        try:
-            img_path = os.path.join("nobg", filename)
-            img = Image.open(img_path).convert("RGB")
-
-            # Масштабирование (модель лучше работает до 512x512)
-            orig_size = img.size
-            img_resized = img.resize((512, 512), Image.LANCZOS) if max(img.size) > 512 else img
-
-            # Используем маску из cropper (или дефолтную)
-            mask_img = Image.new("L", img_resized.size, 0)
-            draw = ImageDraw.Draw(mask_img)
-            if 'box' in st.session_state:
-                x0, y0, x1, y1 = [int(v * 512 / orig_size[0]) for v in st.session_state.box[:4]]
-                draw.rectangle([x0, y0, x1, y1], fill=255)
-            else:
-                # Если нет маски — автоматическая (низ)
-                w, h = img_resized.size
-                draw.rectangle([w // 2 - 100, h - 80, w // 2 + 100, h - 20], fill=255)
-
-            # Инпейнтинг
-            result = pipe(
-                prompt=prompt,
-                image=img_resized,
-                mask_image=mask_img,
-                strength=0.75,
-                guidance_scale=7.5,
-                num_inference_steps=30
-            ).images[0]
-
-            # Восстановить оригинальный размер
-            result = result.resize(orig_size, Image.LANCZOS)
-            clean_path = os.path.join("clean", filename)
-            result.save(clean_path, "PNG")
-
-        except Exception as e:
-            st.warning(f"Ошибка при обработке {filename}: {e}")
-
-        progress_bar.progress((i + 1) / len(os.listdir("nobg")))
-
-    st.success("✅ Все водяные знаки удалены!")
-    st.balloons()
-
-    # --- Скачивание результата ---
-    if os.listdir("clean"):
-        st.subheader("✅ Результаты готовы")
-        # Показать первое изображение
-        result_img = Image.open(os.path.join("clean", os.listdir("clean")[0]))
-        st.image(result_img, caption="Обработанное изображение", use_column_width=True)
-
-        # Создание ZIP
-        zip_buffer = BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w") as zf:
-            for fname in os.listdir("clean"):
-                zf.write(os.path.join("clean", fname), fname)
-        zip_buffer.seek(0)
-
-        st.download_button(
-            label="📦 Скачать все изображения (ZIP)",
-            data=zip_buffer,
-            file_name="cleaned_images.zip",
-            mime="application/zip"
-        )
-
-# --- Подвал ---
-st.markdown("---")
-st.caption("Создано с ❤️ с использованием Streamlit, rembg и Stable Diffusion.")
+                st.error(f"❌ Ошибка при восстановлении: {e}")
