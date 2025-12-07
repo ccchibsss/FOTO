@@ -5,5 +5,4 @@ numpy>=1.21.0
 opencv-python==4.9.0.80
 Pillow>=9.0.0
 requests>=2.25.0
-lama-cleaner==0.0.14
-tqdm
+lama-cleaner>=1.0.0
