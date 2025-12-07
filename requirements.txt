@@ -1,5 +1,5 @@
 streamlit==1.23.0
-streamlit_cropper==0.0.9
+streamlit_cropper>=0.1.0
 Pillow==9.5.0
 numpy==1.24.2
 rembg==2.0.55
