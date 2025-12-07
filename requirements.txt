@@ -1,0 +1,10 @@
+streamlit
+streamlit-cropper
+rembg
+diffusers
+torch
+Pillow
+numpy
+opencv-python
+zipfile36
+tqdm
