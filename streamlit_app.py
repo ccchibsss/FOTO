@@ -349,8 +349,8 @@ class HighVolumeAutoPartsCatalog:
             on_conflict_action = f"DO UPDATE SET {update_clause}"
 
         sql = f"""
-            INSERT INTO "{table_name}"
-            SELECT * FROM "{temp_view_name}"
+            INSERT INTO {table_name}
+            SELECT * FROM {temp_view_name}
             ON CONFLICT ({pk_str}) {on_conflict_action};
         """
 
@@ -471,7 +471,7 @@ class HighVolumeAutoPartsCatalog:
             ])
 
             parts_df = parts_df.with_columns(
-                pl.when(
+                dimensions_str=pl.when(
                     (pl.col('dimensions_str').is_not_null()) & 
                     (pl.col('dimensions_str').cast(pl.Utf8) != '')
                 ).then(
@@ -556,8 +556,12 @@ class HighVolumeAutoPartsCatalog:
                 COALESCE(pr.currency, 'RUB') AS "Валюта",
                 """
 
-        exclusion_condition = " OR ".join([f"r.representative_name NOT ILIKE '%{ex}%'" for ex in self.exclusion_rules if ex.strip()])
-        exclusion_where = f"AND ({exclusion_condition})" if exclusion_condition else ""
+        # Исправленное условие исключения (AND NOT (... OR ...))
+        if self.exclusion_rules:
+            exclusion_condition = " OR ".join([f"r.representative_name ILIKE '%{ex}%'" for ex in self.exclusion_rules if ex.strip()])
+            exclusion_where = f"AND NOT ({exclusion_condition})"
+        else:
+            exclusion_where = ""
 
         columns_map = [
             ("Артикул бренда", 'r.artikul AS "Артикул бренда"'),
@@ -614,10 +618,10 @@ class HighVolumeAutoPartsCatalog:
                 ANY_VALUE(o.applicability) AS representative_applicability,
                 ANY_VALUE(o.category) AS representative_category
             FROM cross_references cr
-            LEFT JOIN "oe" o ON cr.oe_number_norm = o.oe_number_norm
+            LEFT JOIN oe o ON cr.oe_number_norm = o.oe_number_norm
             GROUP BY cr.artikul_norm, cr.brand_norm
         ),
-        "AllAnalogs" AS (
+        AllAnalogs AS (
             SELECT 
                 cr1.artikul_norm, 
                 cr1.brand_norm,
@@ -627,16 +631,16 @@ class HighVolumeAutoPartsCatalog:
                         '[^0-9A-Za-zА-Яа-яЁё`\\-\\s]', '', 'g'
                     ), ', '
                 ) AS analog_list
-            FROM "cross_references" cr1
-            JOIN "cross_references" cr2 ON cr1.oe_number_norm = cr2.oe_number_norm
-            JOIN "parts" p2 ON cr2.artikul_norm = p2.artikul_norm AND cr2.brand_norm = p2.brand_norm
+            FROM cross_references cr1
+            JOIN cross_references cr2 ON cr1.oe_number_norm = cr2.oe_number_norm
+            JOIN parts p2 ON cr2.artikul_norm = p2.artikul_norm AND cr2.brand_norm = p2.brand_norm
             WHERE (cr1.artikul_norm != p2.artikul_norm OR cr1.brand_norm != p2.brand_norm)
             GROUP BY cr1.artikul_norm, cr1.brand_norm
         ),
         InitialOENumbers AS (
             SELECT DISTINCT p.artikul_norm, p.brand_norm, cr.oe_number_norm
-            FROM "parts" p
-            LEFT JOIN "cross_references" cr ON p.artikul_norm = cr.artikul_norm AND p.brand_norm = cr.brand_norm
+            FROM parts p
+            LEFT JOIN cross_references cr ON p.artikul_norm = cr.artikul_norm AND p.brand_norm = cr.brand_norm
             WHERE cr.oe_number_norm IS NOT NULL
         ),
         Level1Analogs AS (
@@ -645,8 +649,8 @@ class HighVolumeAutoPartsCatalog:
                 i.brand_norm AS source_brand_norm,
                 cr2.artikul_norm AS related_artikul_norm, 
                 cr2.brand_norm AS related_brand_norm
-            FROM "InitialOENumbers" i
-            JOIN "cross_references" cr2 ON i.oe_number_norm = cr2.oe_number_norm
+            FROM InitialOENumbers i
+            JOIN cross_references cr2 ON i.oe_number_norm = cr2.oe_number_norm
             WHERE NOT (i.artikul_norm = cr2.artikul_norm AND i.brand_norm = cr2.brand_norm)
         ),
         Level1OENumbers AS (
@@ -654,10 +658,10 @@ class HighVolumeAutoPartsCatalog:
                 l1.source_artikul_norm, 
                 l1.source_brand_norm, 
                 cr3.oe_number_norm
-            FROM "Level1Analogs" l1
-            JOIN "cross_references" cr3 ON l1.related_artikul_norm = cr3.artikul_norm AND l1.related_brand_norm = cr3.brand_norm
+            FROM Level1Analogs l1
+            JOIN cross_references cr3 ON l1.related_artikul_norm = cr3.artikul_norm AND l1.related_brand_norm = cr3.brand_norm
             WHERE NOT EXISTS (
-                SELECT 1 FROM "InitialOENumbers" i
+                SELECT 1 FROM InitialOENumbers i
                 WHERE i.artikul_norm = l1.source_artikul_norm 
                   AND i.brand_norm = l1.source_brand_norm 
                   AND i.oe_number_norm = cr3.oe_number_norm
@@ -669,16 +673,16 @@ class HighVolumeAutoPartsCatalog:
                 loe.source_brand_norm,
                 cr4.artikul_norm AS related_artikul_norm, 
                 cr4.brand_norm AS related_brand_norm
-            FROM "Level1OENumbers" loe
-            JOIN "cross_references" cr4 ON loe.oe_number_norm = cr4.oe_number_norm
+            FROM Level1OENumbers loe
+            JOIN cross_references cr4 ON loe.oe_number_norm = cr4.oe_number_norm
             WHERE NOT (loe.source_artikul_norm = cr4.artikul_norm AND loe.source_brand_norm = cr4.brand_norm)
         ),
         AllRelatedParts AS (
             SELECT source_artikul_norm, source_brand_norm, related_artikul_norm, related_brand_norm
-            FROM "Level1Analogs"
+            FROM Level1Analogs
             UNION
             SELECT source_artikul_norm, source_brand_norm, related_artikul_norm, related_brand_norm
-            FROM "Level2Analogs"
+            FROM Level2Analogs
         ),
         AggregatedAnalogData AS (
             SELECT 
@@ -716,13 +720,15 @@ class HighVolumeAutoPartsCatalog:
                         ELSE NULL
                     END
                 ) AS representative_category
-            FROM "AllRelatedParts" arp
-            JOIN "parts" p2 ON arp.related_artikul_norm = p2.artikul_norm AND arp.related_brand_norm = p2.brand_norm
-            LEFT JOIN "PartDetails" pd2 ON p2.artikul_norm = pd2.artikul_norm AND p2.brand_norm = pd2.brand_norm
+            FROM AllRelatedParts arp
+            JOIN parts p2 ON arp.related_artikul_norm = p2.artikul_norm AND arp.related_brand_norm = p2.brand_norm
+            LEFT JOIN PartDetails pd2 ON p2.artikul_norm = pd2.artikul_norm AND p2.brand_norm = pd2.brand_norm
             GROUP BY arp.source_artikul_norm, arp.source_brand_norm
         ),
         RankedData AS (
             SELECT 
+                p.artikul_norm,
+                p.brand_norm,
                 p.artikul,
                 p.brand,
                 p.description,
@@ -750,18 +756,18 @@ class HighVolumeAutoPartsCatalog:
                     PARTITION BY p.artikul_norm, p.brand_norm 
                     ORDER BY pd.representative_name DESC NULLS LAST, pd.oe_list DESC NULLS LAST
                 ) AS rn
-            FROM "parts" p
-            LEFT JOIN "PartDetails" pd ON p.artikul_norm = pd.artikul_norm AND p.brand_norm = pd.brand_norm
-            LEFT JOIN "AllAnalogs" aa ON p.artikul_norm = aa.artikul_norm AND p.brand_norm = aa.brand_norm
-            LEFT JOIN "AggregatedAnalogData" p_analog ON p.artikul_norm = p_analog.artikul_norm AND p.brand_norm = p_analog.brand_norm
+            FROM parts p
+            LEFT JOIN PartDetails pd ON p.artikul_norm = pd.artikul_norm AND p.brand_norm = pd.brand_norm
+            LEFT JOIN AllAnalogs aa ON p.artikul_norm = aa.artikul_norm AND p.brand_norm = aa.brand_norm
+            LEFT JOIN AggregatedAnalogData p_analog ON p.artikul_norm = p_analog.artikul_norm AND p.brand_norm = p_analog.brand_norm
         )
         """
 
         select_clause = ",\n        ".join(select_exprs)
 
         price_join = """
-        LEFT JOIN "prices" pr ON r.artikul_norm = pr.artikul_norm AND r.brand_norm = pr.brand_norm
-        LEFT JOIN "BrandMarkups" brm ON r.brand = brm.brand
+        LEFT JOIN prices pr ON r.artikul_norm = pr.artikul_norm AND r.brand_norm = pr.brand_norm
+        LEFT JOIN BrandMarkups brm ON r.brand = brm.brand
         """ if include_prices else ""
 
         query = f"""
@@ -769,8 +775,8 @@ class HighVolumeAutoPartsCatalog:
         SELECT
             {price_case}
             {select_clause}
-        FROM "RankedData" r
-        CROSS JOIN "DescriptionTemplate" dt
+        FROM RankedData r
+        CROSS JOIN DescriptionTemplate dt
         {price_join}
         WHERE r.rn = 1
         {exclusion_where}
@@ -903,11 +909,8 @@ class HighVolumeAutoPartsCatalog:
                 else:
                     st.warning("Неподдерживаемый формат")
                     return
-            try:
-                with open(output_path, "rb") as f:
-                    st.download_button("⬇️ Скачать файл", f, file_name=output_path.name)
-            except FileNotFoundError:
-                st.error("Файл не найден. Возможно, экспорт завершился с ошибкой.")
+            with open(output_path, "rb") as f:
+                st.download_button("⬇️ Скачать файл", f, file_name=output_path.name)
 
     def show_price_settings(self):
         st.header("💰 Управление ценами и наценками")
@@ -995,7 +998,7 @@ class HighVolumeAutoPartsCatalog:
                 "Название товара": list(self.category_mapping.keys()),
                 "Категория": list(self.category_mapping.values())
             }).to_pandas()
-            st.dataframe(mapping_df, use_container_width=True, hide_index=True)
+            st.dataframe(mapping_df, width='stretch', hide_index=True)
         else:
             st.write("Нет пользовательских правил")
 
@@ -1014,7 +1017,7 @@ class HighVolumeAutoPartsCatalog:
                 self.category_mapping[name_pattern.strip()] = category.strip()
                 self.save_category_mapping()
                 st.success(f"Добавлено: {name_pattern.strip()} → {category.strip()}")
-                st.rerun()
+                st.experimental_rerun()
             else:
                 st.error("Заполните оба поля")
 
@@ -1029,7 +1032,7 @@ class HighVolumeAutoPartsCatalog:
                 del self.category_mapping[rule_to_delete]
                 self.save_category_mapping()
                 st.success(f"Удалено: {rule_to_delete}")
-                st.rerun()
+                st.experimental_rerun()
 
     def show_cloud_sync(self):
         st.header("☁️ Облачная синхронизация")
