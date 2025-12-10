@@ -1,20 +1,44 @@
-import sys
-import os
-import time
-import random
-import threading
-import json
-import io
+import sys, os, subprocess, time, random, threading, json, io, logging
 from urllib.parse import urljoin, urlparse
 
-# Optional GUI
-try:
-    import streamlit as st  # type: ignore
-    STREAMLIT_AVAILABLE = True
-except Exception:
-    STREAMLIT_AVAILABLE = False
+# Setup logging to console + file
+LOG_FILE = "scraper.log"
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s",
+                    handlers=[logging.StreamHandler(sys.stdout),
+                              logging.FileHandler(LOG_FILE, encoding="utf-8")])
+logger = logging.getLogger(__name__)
 
-# Required libs; if missing, print instructions and exit gracefully
+# --- Dependency check + optional auto-install with captured logs ---
+REQUIRED_MODULES = {"requests": "requests", "bs4": "beautifulsoup4", "pandas": "pandas",
+                    "xlsxwriter": "XlsxWriter", "urllib3": "urllib3"}
+missing_pkgs = []
+for mod, pkg in REQUIRED_MODULES.items():
+    try:
+        __import__(mod)
+    except Exception:
+        missing_pkgs.append(pkg)
+
+INSTALL_LOG = "install_log.txt"
+if missing_pkgs:
+    logger.info("Missing packages detected: %s", ", ".join(missing_pkgs))
+    cmd = [sys.executable, "-m", "pip", "install"] + missing_pkgs
+    try:
+        logger.info("Attempting to pip install missing packages (output -> %s)...", INSTALL_LOG)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
+        with open(INSTALL_LOG, "wb") as f:
+            f.write(proc.stdout or b"")
+        logger.info("pip install finished with returncode=%s", proc.returncode)
+    except subprocess.TimeoutExpired:
+        with open(INSTALL_LOG, "a", encoding="utf-8") as f:
+            f.write("\n[pip install timed out]\n")
+        logger.error("pip install timed out; see %s", INSTALL_LOG)
+    except Exception as e:
+        with open(INSTALL_LOG, "a", encoding="utf-8") as f:
+            f.write(f"\n[pip install error] {e}\n")
+        logger.exception("pip install error: %s", e)
+
+# Try imports (after possible install)
 try:
     import requests
     from bs4 import BeautifulSoup
@@ -22,9 +46,16 @@ try:
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
     from concurrent.futures import ThreadPoolExecutor, as_completed
-except Exception:
-    print("Missing required packages. Install with:\n  python -m pip install requests beautifulsoup4 pandas xlsxwriter urllib3")
+except Exception as e:
+    logger.exception("Missing required libraries after install attempt: %s", e)
     sys.exit(1)
+
+# Optional Streamlit
+try:
+    import streamlit as st  # type: ignore
+    STREAMLIT_AVAILABLE = True
+except Exception:
+    STREAMLIT_AVAILABLE = False
 
 # ---------- Config ----------
 USER_AGENTS = [
@@ -32,31 +63,17 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36",
 ]
-DEFAULT_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-}
+DEFAULT_HEADERS = {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                   "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"}
 SELECTORS = {
-    "ozon": {
-        "card": ("div", {"class": "b5v1"}),
-        "title": ("a", {"class": "a4d3"}),
-        "price": ("div", {"class": "b5v2"}),
-        "img": ("img", {}),
-        "base_domain": "https://ozon.ru",
-    },
-    "wildberries": {
-        "card": ("div", {"class": "product-card"}),
-        "title": ("a", {"class": "product-card__name"}),
-        "price_alt": [("ins", {"class": "price__new"}), ("ins", {"class": "price__old"})],
-        "img": ("img", {"class": "product-card__image"}),
-        "base_domain": "https://www.wildberries.ru",
-    },
+    "ozon": {"card": ("div", {"class": "b5v1"}), "title": ("a", {"class": "a4d3"}), "price": ("div", {"class": "b5v2"}), "img": ("img", {}), "base_domain": "https://ozon.ru"},
+    "wildberries": {"card": ("div", {"class": "product-card"}), "title": ("a", {"class": "product-card__name"}),
+                    "price_alt": [("ins", {"class": "price__new"}), ("ins", {"class": "price__old"})],
+                    "img": ("img", {"class": "product-card__image"}), "base_domain": "https://www.wildberries.ru"},
 }
 RETRY_STRATEGY = Retry(total=3, status_forcelist=(429, 500, 502, 503, 504), backoff_factor=1, allowed_methods=frozenset(["GET"]))
-ROBOTS_CACHE = {}
-ROBOTS_LOCK = threading.Lock()
-DOMAIN_RATE = {}
-DOMAIN_LOCK = threading.Lock()
+ROBOTS_CACHE, ROBOTS_LOCK = {}, threading.Lock()
+DOMAIN_RATE, DOMAIN_LOCK = {}, threading.Lock()
 THREAD_LOCAL = threading.local()
 
 # ---------- Network helpers ----------
@@ -65,8 +82,7 @@ def make_session():
     s.headers.update(DEFAULT_HEADERS)
     s.headers["User-Agent"] = random.choice(USER_AGENTS)
     adapter = HTTPAdapter(max_retries=RETRY_STRATEGY, pool_connections=10, pool_maxsize=10)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
+    s.mount("http://", adapter); s.mount("https://", adapter)
     return s
 
 def get_thread_session():
@@ -94,18 +110,15 @@ def is_allowed(url):
     if not txt:
         return True
     lines = [l.strip() for l in txt.splitlines() if l.strip() and not l.strip().startswith("#")]
-    ua = None
-    disallows = []
+    ua = None; disallows = []
     for ln in lines:
         if ln.lower().startswith("user-agent"):
             ua = ln.split(":",1)[1].strip()
         elif ln.lower().startswith("disallow") and ua == "*":
-            v = ln.split(":",1)[1].strip()
-            disallows.append(v)
+            v = ln.split(":",1)[1].strip(); disallows.append(v)
     path = urlparse(url).path or "/"
     for d in disallows:
-        if d == "":
-            continue
+        if d == "": continue
         if d == "/" or path.startswith(d):
             return False
     return True
@@ -116,11 +129,14 @@ def wait_for_domain(host, min_interval):
         now = time.time()
         wait = max(0, min_interval - (now - last))
         if wait:
+            logger.debug("Waiting %.2fs for domain %s", wait, host)
             time.sleep(wait)
         DOMAIN_RATE[host] = time.time()
 
 def safe_get(url, delay_between_requests=1.0, timeout=15):
+    logger.info("GET %s", url)
     if not is_allowed(url):
+        logger.warning("robots.txt disallows access to %s (best-effort)", url)
         return None, {"error": "robots.txt запрещает доступ (best-effort)"}
     host = urlparse(url).netloc.lower()
     jitter = random.uniform(0.2, 0.6)
@@ -131,11 +147,14 @@ def safe_get(url, delay_between_requests=1.0, timeout=15):
     try:
         r = session.get(url, timeout=timeout)
         r.raise_for_status()
-        snippet = r.text[:5000].lower()
+        snippet = (r.text or "")[:5000].lower()
         if any(x in snippet for x in ("captcha", "are you a human", "access denied", "verify you are human")):
+            logger.warning("Possible captcha/block detected at %s", url)
             return r, {"error": "blocked_or_captcha_detected"}
+        logger.info("Loaded %s (status=%s, bytes=%s)", url, r.status_code, len(r.text or ""))
         return r, None
     except requests.RequestException as e:
+        logger.error("Request failed for %s: %s", url, e)
         return None, {"error": str(e)}
 
 # ---------- Parsing helpers ----------
@@ -219,6 +238,7 @@ def fetch_product_detail(url, delay_between_requests=1.0):
         detail.update(extract_attributes_from_detail_soup(soup))
         return detail
     except Exception as e:
+        logger.exception("Failed parsing detail page %s: %s", url, e)
         return {"error": f"parse_error: {e}"}
 
 def process_product(base_info, delay_details):
@@ -259,8 +279,10 @@ def scrape_seller(seller_url, site_key, max_pages=5, delay_pages=1.0, delay_deta
                 try:
                     items.append(f.result())
                 except Exception as e:
+                    logger.exception("Product processing error: %s", e)
                     if progress_callback: progress_callback(f"Product error: {e}")
         time.sleep(delay_pages + random.uniform(0.1,0.5))
+    logger.info("Scraping complete. Total items: %d", len(items))
     return items
 
 def detect_site_from_url(url):
@@ -285,41 +307,40 @@ def run_cli(args=None):
     url = parsed.url
     if not url:
         try:
-            url = input("Enter seller/shop URL: ").strip()
+            url = input("Enter seller/shop URL (leave blank to exit): ").strip()
         except Exception:
-            print("No URL provided. Exiting.")
-            return
+            url = ""
         if not url:
-            print("No URL entered. Exiting.")
+            logger.info("No URL entered; exiting without error.")
             return
 
     site = parsed.site or detect_site_from_url(url)
     if not site:
         try:
-            site = input("Could not detect site. Enter 'ozon' or 'wildberries': ").strip().lower()
+            site = input("Could not detect site. Enter 'ozon' or 'wildberries' (leave blank to exit): ").strip().lower()
         except Exception:
-            print("Site not provided. Exiting.")
-            return
+            site = ""
         if site not in ("ozon","wildberries"):
-            print("Invalid site. Exiting.")
+            logger.error("Invalid or missing site; exiting.")
             return
 
-    def prog(m): print("[+]", m)
+    def prog(m):
+        logger.info(m); print(m)
     items = scrape_seller(url, site, max_pages=parsed.pages, delay_pages=parsed.delay_pages,
                           delay_details=parsed.delay_details, max_workers=parsed.workers, progress_callback=prog)
     if not items:
-        print("No items scraped or blocked.")
+        logger.info("No items scraped or blocked.")
         return
     df = pd.DataFrame(items)
-    print(f"Scraped {len(df)} items. Saving to {parsed.out} ...")
+    logger.info("Saving %d items to %s", len(df), parsed.out)
     try:
         df.to_excel(parsed.out, index=False, engine="xlsxwriter")
-        print("Saved:", parsed.out)
+        logger.info("Saved Excel: %s", parsed.out)
     except Exception as e:
         fallback = parsed.out.rsplit(".",1)[0] + ".json"
         with open(fallback, "w", encoding="utf-8") as f:
             json.dump(items, f, ensure_ascii=False, indent=2)
-        print("Failed to save Excel, saved JSON to", fallback, "error:", e)
+        logger.exception("Failed to save Excel; saved JSON to %s", fallback)
 
 def run_streamlit():
     st.title("Улучшенный парсер OZON и Wildberries")
@@ -331,23 +352,22 @@ def run_streamlit():
     workers = st.number_input("Threads", min_value=1, max_value=20, value=4)
     if st.button("Start"):
         if not url:
-            st.warning("Enter URL")
-            return
+            st.warning("Enter URL"); return
         site = None if site_choice == "auto" else site_choice
         if site is None:
             site = detect_site_from_url(url)
             if not site:
-                st.error("Could not detect site. Choose manually.")
-                return
-        prog_area = st.empty()
-        def progress_callback(m): prog_area.text(m)
+                st.error("Could not detect site. Choose manually."); return
+        progress_area = st.empty()
+        def progress_callback(m):
+            logger.info(m)
+            progress_area.text(m)
         with st.spinner("Scraping..."):
             items = scrape_seller(url, site, max_pages=int(max_pages), delay_pages=float(delay_pages),
                                   delay_details=float(delay_details), max_workers=int(workers),
                                   progress_callback=progress_callback)
         if not items:
-            st.info("Nothing found or blocked.")
-            return
+            st.info("Nothing found or blocked."); return
         df = pd.DataFrame(items)
         st.success(f"Found {len(df)} items")
         st.dataframe(df)
@@ -360,17 +380,14 @@ def run_streamlit():
 
 # ---------- Entrypoint ----------
 if __name__ == "__main__":
-    args = sys.argv[1:]
-    if "--gui" in args:
+    argv = sys.argv[1:]
+    if "--gui" in argv:
         if not STREAMLIT_AVAILABLE:
-            print("Streamlit is not installed. Install with: python -m pip install streamlit")
+            logger.error("Streamlit is not installed. Install with: python -m pip install streamlit")
             sys.exit(1)
-        # When running with `python script.py --gui` we can't start Streamlit server here;
-        # just inform user how to run it.
-        print("To run the GUI: streamlit run " + os.path.abspath(__file__))
+        logger.info("To run the GUI: streamlit run %s", os.path.abspath(__file__))
+        print("To run the GUI: streamlit run", os.path.abspath(__file__))
     elif STREAMLIT_AVAILABLE and ("streamlit" in " ".join(sys.argv) or os.environ.get("STREAMLIT_RUNNING") or os.getenv("STREAMLIT_SERVER_RUNNING")):
-        # Likely invoked via `streamlit run`, start the app
         run_streamlit()
     else:
-        # CLI mode (interactive fallback if URL omitted)
-        run_cli(args=args)
+        run_cli(argv)
