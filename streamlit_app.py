@@ -1,25 +1,11 @@
-Вот полный пример кода для сбора карточек товаров с маркетплейса OZON, включая извлечение характеристик и изображений, с интеграцией в интерфейс Streamlit и сохранением в базу данных SQLite.
-
-**Обратите внимание:**  
-- Вам нужно установить необходимые библиотеки (`playwright`, `streamlit`, `pandas`, `sqlite3` входит в стандартную библиотеку Python).  
-- Перед запуском выполните `playwright install` в командной строке, чтобы установить движки браузеров.  
-- Замените переменную `search_query` и параметры на ваши нужды.
-
----
-
-```python
 import streamlit as st
 import pandas as pd
 import sqlite3
 import time
 from datetime import datetime
-import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from playwright.sync_api import sync_playwright
-
-# Логирование
-logging.basicConfig(level=logging.INFO)
 
 # Инициализация базы данных
 def init_db():
@@ -46,14 +32,12 @@ def init_db():
             FOREIGN KEY(product_id) REFERENCES products(id)
         )
     ''')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_query ON products(query)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_title ON products(title)')
     conn.commit()
     conn.close()
 
 init_db()
 
-# --- Кеширование извлечения характеристик и изображений ---
+# --- Кеширование для ускорения ---
 @lru_cache(maxsize=1000)
 def fetch_product_details_cached(product_url):
     return fetch_product_details(product_url)
@@ -86,13 +70,12 @@ def fetch_product_details(product_url):
             browser.close()
             return image_url, characteristics
     except Exception as e:
-        logging.error(f"Ошибка при получении данных по {product_url}: {e}")
+        print(f"Error fetching {product_url}: {e}")
         return None, {}
 
-# --- Функция для парсинга одного товара ---
 def parse_product(item):
     try:
-        title = item.query_selector(".div[@data-testid='product-title']").inner_text()
+        title = item.query_selector("[data-testid='product-title']").inner_text()
         price = item.query_selector("[data-testid='price']").inner_text()
         link = item.query_selector("a[data-testid='product-link']").get_attribute("href")
         image_url, characteristics = fetch_product_details_cached(link)
@@ -104,10 +87,9 @@ def parse_product(item):
             'characteristics': characteristics
         }
     except Exception as e:
-        logging.error(f"Ошибка при парсинге товара: {e}")
+        print(f"Error parsing product: {e}")
         return None
 
-# --- Парсинг результатов поиска ---
 def fetch_search_results(query, max_items=20, max_pages=2):
     results = []
 
@@ -133,14 +115,19 @@ def fetch_search_results(query, max_items=20, max_pages=2):
                 if total_fetched >= max_items:
                     break
             except Exception as e:
-                logging.error(f"Ошибка при загрузке страницы {url}: {e}")
+                print(f"Error loading page {url}: {e}")
         browser.close()
     return results
 
-# --- Сохранение в базу ---
 def save_product_to_db(product, timestamp, query):
     conn = sqlite3.connect('ozon_extended.db')
     c = conn.cursor()
+    # Предварительно пытаемся распарсить цену
+    try:
+        price_str = product['price'].replace('₽', '').replace(' ', '').replace('₸', '').replace('руб', '').strip()
+        price_num = float(price_str)
+    except:
+        price_num = None
     c.execute('''
         INSERT INTO products (timestamp, query, title, price, link, price_num, image_url)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -150,7 +137,7 @@ def save_product_to_db(product, timestamp, query):
         product['title'],
         product['price'],
         product['link'],
-        None,
+        price_num,
         product['image_url']
     ))
     product_id = c.lastrowid
@@ -162,7 +149,6 @@ def save_product_to_db(product, timestamp, query):
     conn.commit()
     conn.close()
 
-# --- Экспорт данных ---
 def export_data(format='csv'):
     conn = sqlite3.connect('ozon_extended.db')
     df = pd.read_sql_query("SELECT * FROM products", conn)
@@ -175,16 +161,56 @@ def export_data(format='csv'):
 # --- Streamlit интерфейс ---
 st.title("Расширенный сбор данных с OZON (характеристики + изображения)")
 
+# Настройка поиска и параметров
 search_query = st.text_input("Введите ключевое слово для поиска", value="ноутбук")
+max_items = st.number_input("Количество товаров для сбора", min_value=1, max_value=100, value=20)
+max_pages = st.number_input("Количество страниц", min_value=1, max_value=10, value=2)
+
+st.sidebar.header("Фильтры")
+price_min = st.sidebar.number_input("Мин. цена", value=0)
+price_max = st.sidebar.number_input("Макс. цена", value=100000)
+
+# Кнопка для запуска сбора
 if st.button("Запустить сбор данных"):
-    with st.spinner("Сбор данных запущен..."):
-        results = fetch_search_results(search_query, max_items=20, max_pages=2)
+    with st.spinner("Обработка..."):
+        results = fetch_search_results(search_query, max_items=int(max_items), max_pages=int(max_pages))
         timestamp = str(datetime.now())
         count = 0
         for product in results:
+            # Фильтр по цене
+            try:
+                price_str = product['price'].replace('₽', '').replace(' ', '').replace('₸', '').replace('руб', '').strip()
+                price_num = float(price_str)
+            except:
+                price_num = None
+            if price_num is not None and (price_num < price_min or price_num > price_max):
+                continue
             save_product_to_db(product, timestamp, search_query)
             count += 1
         st.success(f"Собрано и сохранено товаров: {count}")
+
+# Таблица с фильтрацией
+st.header("Фильтр товаров")
+conn = sqlite3.connect('ozon_extended.db')
+df_all = pd.read_sql_query("SELECT * FROM products", conn)
+conn.close()
+
+# добавим фильтры по цене и названию
+filtered_df = df_all[
+    (df_all['price_num'] >= price_min) &
+    (df_all['price_num'] <= price_max) &
+    (df_all['title'].str.contains(st.text_input("Фильтр по названию", value=""), case=False))
+]
+
+st.dataframe(filtered_df)
+
+# Выбор товаров для экспорта
+st.subheader("Выберите товары для экспорта")
+selected_ids = st.multiselect("Выберите товары", options=filtered_df['id'])
+if st.button("Экспортировать выбранные в CSV") and selected_ids:
+    df_export = pd.read_sql_query(f"SELECT * FROM products WHERE id IN ({','.join(map(str, selected_ids))})", sqlite3.connect('ozon_extended.db'))
+    df_export.to_csv('ozon_selected_export.csv', index=False)
+    st.success("Экспортировано!")
 
 # Просмотр последних товаров
 st.header("Последние собранные товары")
@@ -207,17 +233,14 @@ for _, row in df_products.iterrows():
         for _, ch_row in chars.iterrows():
             st.write(f"**{ch_row['key']}**: {ch_row['value']}")
 
-# Экспорт данных
-st.header("Экспорт данных")
-if st.button("Экспортировать в CSV"):
-    export_data('csv')
-    st.success("Данные экспортированы в ozon_products_export.csv")
-if st.button("Экспортировать в JSON"):
-    export_data('json')
-    st.success("Данные экспортированы в ozon_products_export.json")
-```
-
----
-
-Этот скрипт собирает карточки товаров с OZON, извлекает характеристики и изображения, сохраняет их в базу и предоставляет интерфейс для поиска и экспорта данных.  
-Обязательно настройте параметры и протестируйте на своих условиях!
+# Экспорт всего набора данных
+st.header("Экспортировать все данные")
+col1, col2 = st.columns(2)
+with col1:
+    if st.button("Экспортировать в CSV"):
+        export_data('csv')
+        st.success("Данные экспортированы в ozon_products_export.csv")
+with col2:
+    if st.button("Экспортировать в JSON"):
+        export_data('json')
+        st.success("Данные экспортированы в ozon_products_export.json")
