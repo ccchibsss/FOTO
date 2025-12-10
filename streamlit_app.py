@@ -1,152 +1,56 @@
-#!/usr/bin/env python3
+# streamlit_scraper_full_commented.py
 """
-full_scraper_with_installer.py
+Streamlit app: robust OZON / Wildberries seller scraper with comments.
 
-Полный самодостаточный скрипт парсера (OZON / Wildberries) с автоматической
-попыткой установки зависимостей при старте, включая создание виртуального окружения.
+Usage:
+  streamlit run streamlit_scraper_full_commented.py
+
+Features (concise):
+- Simple dependency check (shows helpful message inside Streamlit).
+- Thread-local requests.Session with retry adapter.
+- Per-domain rate limiting + jitter to be polite.
+- Basic robots.txt "best-effort" check (cached).
+- Extracts card-level info (title, link, price, image) and optionally loads product details.
+- Parallel fetching of product detail pages with ThreadPoolExecutor.
+- Download results as XLSX or JSON.
+- Defensive error handling and progress log.
+
+Notes:
+- The CSS selectors are examples and may need updates per real site HTML.
+- Respect site ToS and robots.txt.
 """
 
-import sys
-import os
-import venv
-import subprocess
+from __future__ import annotations
 import time
 import random
 import threading
 import json
 import io
-import logging
 from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import urljoin, urlparse
 
-# ================== Встроенная логика автозапуска в виртуальном окружении ==================
-
-def in_virtualenv():
-    return hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix)
-
-def create_virtualenv(env_dir: str = "venv") -> bool:
-    if os.path.exists(env_dir):
-        print(f"[info] Виртуальное окружение уже существует по пути '{env_dir}'.")
-        return True
-    try:
-        print(f"[info] Создаю виртуальное окружение в '{env_dir}'...")
-        venv.create(env_dir, with_pip=True)
-        print("[info] Виртуальное окружение создано.")
-        return True
-    except Exception as e:
-        print(f"[error] Не удалось создать виртуальное окружение: {e}")
-        return False
-
-def restart_in_venv(env_dir: str = "venv"):
-    if sys.platform == "win32":
-        python_executable = os.path.join(env_dir, "Scripts", "python.exe")
-    else:
-        python_executable = os.path.join(env_dir, "bin", "python")
-    if not os.path.exists(python_executable):
-        print(f"[error] Python-исполнитель не найден по пути {python_executable}")
-        sys.exit(1)
-    print(f"[info] Перезапуск внутри виртуального окружения...")
-    os.execv(python_executable, [python_executable] + sys.argv)
-
-# Проверка, запущен ли уже внутри виртуального окружения
-if not in_virtualenv():
-    env_dir = "venv"
-    if create_virtualenv(env_dir):
-        restart_in_venv(env_dir)
-    else:
-        print("[error] Не удалось создать виртуальное окружение. Установите зависимости вручную.")
-        sys.exit(1)
-
-# ================== Далее идет ваш скрипт ==================
-
-# Ваш исходный код начинается здесь...
-
-# from __future__ import annotations
-import sys
-import os
-import subprocess
-import time
-import random
-import threading
-import json
-import io
-import logging
-from typing import Optional, Dict, Any, List, Tuple
-from urllib.parse import urljoin, urlparse
-
-# ----------------- Automatic dependency installer -----------------
-REQUIREMENTS = {
-    "requests": "requests",
-    "bs4": "beautifulsoup4",
-    "pandas": "pandas",
-    "xlsxwriter": "XlsxWriter",
-    "urllib3": "urllib3",
-}
-OPTIONAL = {
-    "streamlit": "streamlit",
-}
-INSTALL_LOG = "install_log.txt"
-
-def try_install_missing():
-    missing = []
-    for mod, pkg in REQUIREMENTS.items():
-        try:
-            __import__(mod)
-        except ImportError:
-            missing.append(pkg)
-    if not missing:
-        return
-    cmd = [sys.executable, "-m", "pip", "install"] + missing
-    print("[info] Обнаружены отсутствующие пакеты: ", ", ".join(missing))
-    print(f"[info] Пытаюсь установить: {' '.join(missing)} (лог -> {INSTALL_LOG})")
-    try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600, check=True)
-        out = proc.stdout or b""
-        with open(INSTALL_LOG, "wb") as f:
-            f.write(out)
-        print(f"[info] pip завершил работу (код={proc.returncode}), смотрите {INSTALL_LOG}")
-    except subprocess.TimeoutExpired:
-        with open(INSTALL_LOG, "a", encoding="utf-8") as f:
-            f.write("\n[pip install timed out]\n")
-        print("[error] Время выполнения pip превысило лимит, смотрите", INSTALL_LOG)
-    except subprocess.CalledProcessError as e:
-        with open(INSTALL_LOG, "a", encoding="utf-8") as f:
-            f.write(f"\n[pip install error] {e}\n")
-        print("[error] Ошибка при выполнении pip, смотрите", INSTALL_LOG)
-
-try_install_missing()
-
-# Try imports; if still missing, inform user and exit
+# ---- Imports and dependency check ----
 try:
+    import streamlit as st
     import requests
     from bs4 import BeautifulSoup
     import pandas as pd
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
     from concurrent.futures import ThreadPoolExecutor, as_completed
-except Exception:
-    print("[fatal] Не удалось импортировать необходимые библиотеки после попытки установки.")
-    print("Проверьте", INSTALL_LOG, "и установите вручную:")
-    pkgs = list(REQUIREMENTS.values()) + list(OPTIONAL.values())
-    print("  python -m pip install " + " ".join(pkgs))
-    sys.exit(1)
+    from urllib.robotparser import RobotFileParser
+except Exception as e:
+    # If streamlit isn't available this script won't run as an app;
+    # print short instruction and stop execution inside streamlit (if started).
+    msg = f"Missing dependency (run outside Streamlit or install): {e}"
+    try:
+        # If running under streamlit import failed, show in terminal and stop.
+        print(msg)
+    except Exception:
+        pass
+    raise
 
-# Optional GUI
-try:
-    import streamlit as st  # type: ignore
-    STREAMLIT_AVAILABLE = True
-except Exception:
-    STREAMLIT_AVAILABLE = False
-
-# ----------------- Логирование -----------------
-LOG_FILE = "scraper.log"
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s",
-                    handlers=[logging.StreamHandler(sys.stdout),
-                              logging.FileHandler(LOG_FILE, encoding="utf-8")])
-logger = logging.getLogger(__name__)
-
-# ----------------- Конфигурация -----------------
+# ---- Constants / config (edit selectors as needed) ----
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
@@ -156,6 +60,7 @@ DEFAULT_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
 }
+# Example selectors; real sites change frequently -> adjust before use.
 SELECTORS = {
     "ozon": {
         "card": ("div", {"class": "b5v1"}),
@@ -174,130 +79,140 @@ SELECTORS = {
         "page_param": "?page={page}",
     },
 }
-RETRY_STRATEGY = Retry(total=3, status_forcelist=(429, 500, 502, 503, 504), backoff_factor=1, allowed_methods=frozenset({"GET"}))
-ROBOTS_CACHE: Dict[str, Optional[object]] = {}
+
+# Retry configuration for requests Session
+RETRY_STRATEGY = Retry(total=3, status_forcelist=(429, 500, 502, 503, 504),
+                       backoff_factor=1, allowed_methods=frozenset({"GET"}))
+
+# Thread-local session, robots cache, domain rate limiting
+THREAD_LOCAL = threading.local()
+ROBOTS_CACHE: Dict[str, Optional[RobotFileParser]] = {}
 ROBOTS_LOCK = threading.Lock()
 DOMAIN_RATE: Dict[str, float] = {}
 DOMAIN_LOCK = threading.Lock()
-THREAD_LOCAL = threading.local()
 
-# ----------------- Вспомогательные функции сети -----------------
+# ---- Network helpers ----
 def make_session() -> requests.Session:
+    """Create a requests.Session with retry adapter and default headers."""
     s = requests.Session()
     s.headers.update(DEFAULT_HEADERS)
     s.headers["User-Agent"] = random.choice(USER_AGENTS)
     adapter = HTTPAdapter(max_retries=RETRY_STRATEGY, pool_connections=10, pool_maxsize=10)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
+    s.mount("http://", adapter); s.mount("https://", adapter)
     return s
 
 def get_thread_session() -> requests.Session:
+    """Return a thread-local session (one per worker thread)."""
     if not getattr(THREAD_LOCAL, "session", None):
         THREAD_LOCAL.session = make_session()
     return THREAD_LOCAL.session
 
-def get_robots_text(base_url: str) -> Optional[str]:
+def get_robot_parser(base_url: str) -> Optional[RobotFileParser]:
+    """
+    Return cached RobotFileParser for a base URL. If robots.txt can't be fetched,
+    cache None and allow fetching (best-effort).
+    """
     parsed = urlparse(base_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
     with ROBOTS_LOCK:
         if base in ROBOTS_CACHE:
             return ROBOTS_CACHE[base]
+    rp = RobotFileParser()
+    robots_url = urljoin(base, "/robots.txt")
     try:
-        r = requests.get(urljoin(base, "/robots.txt"), headers={"User-Agent": USER_AGENTS[0]}, timeout=6)
-        text = r.text if r.status_code == 200 else None
+        rp.set_url(robots_url)
+        rp.read()
+        with ROBOTS_LOCK:
+            ROBOTS_CACHE[base] = rp
+        return rp
     except Exception:
-        text = None
-    with ROBOTS_LOCK:
-        ROBOTS_CACHE[base] = text
-    return text
+        with ROBOTS_LOCK:
+            ROBOTS_CACHE[base] = None
+        return None
 
-def is_allowed(url: str) -> bool:
-    txt = get_robots_text(url)
-    if not txt:
+def allowed_by_robots(url: str, user_agent: str = "*") -> bool:
+    """Check robots.txt (best-effort). If robots cannot be read, return True."""
+    rp = get_robot_parser(url)
+    if rp is None:
         return True
-    lines = [l.strip() for l in txt.splitlines() if l.strip() and not l.strip().startswith("#")]
-    ua = None
-    disallows = []
-    for ln in lines:
-        if ln.lower().startswith("user-agent"):
-            ua = ln.split(":",1)[1].strip()
-        elif ln.lower().startswith("disallow") and ua == "*":
-            v = ln.split(":",1)[1].strip()
-            disallows.append(v)
-    path = urlparse(url).path or "/"
-    for d in disallows:
-        if d == "":
-            continue
-        if d == "/" or path.startswith(d):
-            return False
-    return True
+    try:
+        return rp.can_fetch(user_agent, url)
+    except Exception:
+        return True
 
 def wait_for_domain(host: str, min_interval: float) -> None:
+    """Ensure at least min_interval seconds between requests to same host."""
     with DOMAIN_LOCK:
-        last = DOMAIN_RATE.get(host, 0)
+        last = DOMAIN_RATE.get(host, 0.0)
         now = time.time()
-        wait = max(0, min_interval - (now - last))
-        if wait:
-            time.sleep(wait)
+        to_wait = max(0.0, min_interval - (now - last))
+        if to_wait:
+            time.sleep(to_wait)
         DOMAIN_RATE[host] = time.time()
 
-def safe_get(url: str, delay_between_requests: float = 1.0, timeout: int = 15, ignore_robots: bool = False) -> Tuple[Optional[requests.Response], Optional[Dict[str, Any]]]:
-    logger.info("GET %s", url)
-    if not ignore_robots and not is_allowed(url):
-        logger.warning("robots.txt запрещает %s (по возможности)", url)
+def safe_get(url: str, delay_between_requests: float = 1.0, timeout: int = 15,
+             ignore_robots: bool = False) -> Tuple[Optional[requests.Response], Optional[Dict[str, str]]]:
+    """
+    Perform GET with:
+      - optional robots.txt respect (best-effort)
+      - per-domain rate limiting + jitter
+      - UA rotation
+      - simple detection of blocks/captchas
+    Returns (response, None) on success, or (response_or_none, {"error": ...}) on problem.
+    """
+    if not ignore_robots and not allowed_by_robots(url):
         return None, {"error": "robots_disallow"}
     host = urlparse(url).netloc.lower()
-    jitter = random.uniform(0.2, 0.6)
-    wait_for_domain(host, delay_between_requests + jitter)
+    wait_for_domain(host, delay_between_requests + random.uniform(0.2, 0.6))
     session = get_thread_session()
+    # small chance to rotate UA for this session
     if random.random() < 0.05:
         session.headers["User-Agent"] = random.choice(USER_AGENTS)
     try:
         r = session.get(url, timeout=timeout)
         r.raise_for_status()
         snippet = (r.text or "")[:5000].lower()
-        if any(x in snippet for x in ("captcha", "are you a human", "access denied", "verify you are human")):
-            logger.warning("Возможна блокировка или капча на %s", url)
+        if any(token in snippet for token in ("captcha", "are you a human", "access denied", "verify you are human")):
             return r, {"error": "blocked_or_captcha"}
-        logger.info("Загружен %s (статус=%s, байт=%s)", url, r.status_code, len(r.text or ""))
         return r, None
     except requests.RequestException as e:
-        logger.error("Ошибка запроса %s: %s", url, e)
         return None, {"error": str(e)}
 
-# ----------------- Парсеры -----------------
+# ---- Parsing helpers ----
 def parse_json_ld(soup: BeautifulSoup) -> Dict[str, Any]:
-    data: Dict[str, Any] = {}
+    """Extract data from <script type='application/ld+json'> elements."""
+    out: Dict[str, Any] = {}
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             j = json.loads(script.string or "{}")
             if isinstance(j, dict):
-                data.update(j)
+                out.update(j)
             elif isinstance(j, list):
                 for e in j:
                     if isinstance(e, dict):
-                        data.update(e)
+                        out.update(e)
         except Exception:
             continue
-    return data
+    return out
 
 def extract_attributes_from_detail_soup(soup: BeautifulSoup) -> Dict[str, Any]:
+    """Try many common HTML patterns to extract key/value attributes from a detail page."""
     attrs: Dict[str, Any] = {}
     attrs.update({f"ld_{k}": v for k, v in parse_json_ld(soup).items()})
+    # Table rows
     for table in soup.find_all("table"):
         for row in table.find_all("tr"):
             cols = row.find_all(["td", "th"])
             if len(cols) >= 2:
-                k = cols[0].get_text(strip=True)
-                v = cols[1].get_text(strip=True)
+                k = cols[0].get_text(strip=True); v = cols[1].get_text(strip=True)
                 if k: attrs.setdefault(k, v)
+    # Definition lists
     for dl in soup.find_all("dl"):
-        dt = dl.find_all("dt")
-        dd = dl.find_all("dd")
+        dt = dl.find_all("dt"); dd = dl.find_all("dd")
         for a, b in zip(dt, dd):
-            k = a.get_text(strip=True)
-            v = b.get_text(strip=True)
+            k = a.get_text(strip=True); v = b.get_text(strip=True)
             if k: attrs.setdefault(k, v)
+    # List items with "key: value"
     for li in soup.find_all("li"):
         text = li.get_text(" ", strip=True)
         if ":" in text:
@@ -306,13 +221,15 @@ def extract_attributes_from_detail_soup(soup: BeautifulSoup) -> Dict[str, Any]:
                 if k: attrs.setdefault(k, v)
             except Exception:
                 pass
+    # Meta description/keywords
     for name in ("description", "keywords"):
         meta = soup.find("meta", attrs={"name": name})
         if meta and meta.get("content"):
             attrs.setdefault(name, meta["content"])
     return attrs
 
-def extract_card_info(card: BeautifulSoup, conf: Dict[str, Any]) -> Dict[str, Any]:
+def extract_card_info(card: BeautifulSoup, conf: Dict[str, Any]) -> Dict[str, str]:
+    """Extracts title, link, price, image from a product card element using conf selectors."""
     title_tag = card.find(*conf["title"])
     title = title_tag.get_text(strip=True) if title_tag else "Нет названия"
     link = "Нет ссылки"
@@ -336,7 +253,9 @@ def extract_card_info(card: BeautifulSoup, conf: Dict[str, Any]) -> Dict[str, An
         elif img_url.startswith("/"): img_url = urljoin(conf.get("base_domain", ""), img_url)
     return {"Название": title, "Ссылка": link, "Цена": price, "Фото": img_url}
 
-def fetch_product_detail(url: str, delay_between_requests: float = 1.0, ignore_robots: bool = False) -> Dict[str, Any]:
+def fetch_product_detail(url: str, delay_between_requests: float = 1.0,
+                         ignore_robots: bool = False) -> Dict[str, Any]:
+    """Fetch a product detail page and extract attributes. Returns dict or error dict."""
     if not url or url in ("Нет ссылки", None):
         return {}
     resp, err = safe_get(url, delay_between_requests=delay_between_requests, ignore_robots=ignore_robots)
@@ -346,14 +265,16 @@ def fetch_product_detail(url: str, delay_between_requests: float = 1.0, ignore_r
         soup = BeautifulSoup(resp.text, "html.parser")
         detail: Dict[str, Any] = {}
         h1 = soup.find("h1")
-        if h1: detail["detail_title"] = h1.get_text(strip=True)
+        if h1:
+            detail["detail_title"] = h1.get_text(strip=True)
         detail.update(extract_attributes_from_detail_soup(soup))
         return detail
     except Exception as e:
-        logger.exception("Ошибка парсинга для %s: %s", url, e)
         return {"error": f"parse_error: {e}"}
 
-def process_product(base_info: Dict[str, Any], delay_details: float, ignore_robots: bool = False) -> Dict[str, Any]:
+def process_product(base_info: Dict[str, str], delay_details: float,
+                    ignore_robots: bool = False) -> Dict[str, Any]:
+    """Wrapper for parallel fetching of product details and merging with base info."""
     if base_info.get("Ссылка") not in ("Нет ссылки", None):
         details = fetch_product_detail(base_info["Ссылка"], delay_between_requests=delay_details, ignore_robots=ignore_robots)
     else:
@@ -365,112 +286,135 @@ def process_product(base_info: Dict[str, Any], delay_details: float, ignore_robo
         out["detail_error"] = str(details)
     return out
 
-# ----------------- Основной скрипт -----------------
+# ---- Scraper core ----
+def detect_site_from_url(url: str) -> Optional[str]:
+    dom = urlparse(url).netloc.lower()
+    if "ozon." in dom: return "ozon"
+    if "wildberries" in dom or "wbx" in dom: return "wildberries"
+    return None
+
 def scrape_seller(seller_url: str,
                   site_key: str,
-                  max_pages: int = 5,
+                  max_pages: int = 3,
                   delay_pages: float = 1.0,
                   delay_details: float = 1.0,
                   max_workers: int = 4,
                   progress_callback: Optional[callable] = None,
                   ignore_robots: bool = False) -> List[Dict[str, Any]]:
+    """
+    Iterate pages, parse cards, and fetch details in parallel.
+    Returns list of item dicts.
+    """
     conf = SELECTORS.get(site_key)
     if not conf:
-        raise ValueError("Сайт не настроен в SELECTORS")
+        raise ValueError("Site not configured in SELECTORS")
     items: List[Dict[str, Any]] = []
-    page_param_format = conf.get("page_param", "?page={page}")
-    for page in range(1, max_pages+1):
-        page_suffix = page_param_format.format(page=page)
+    for page in range(1, max_pages + 1):
+        page_suffix = conf.get("page_param", "?page={page}").format(page=page)
         page_url = f"{seller_url.rstrip('/')}{page_suffix}"
-        if progress_callback: progress_callback(f"Загрузка {page_url}")
+        if progress_callback: progress_callback(f"Loading {page_url}")
         resp, err = safe_get(page_url, delay_between_requests=delay_pages, ignore_robots=ignore_robots)
         if err:
-            if progress_callback: progress_callback(f"Ошибка страницы: {err.get('error')}")
-            logger.warning("Остановка из-за ошибки страницы: %s", err)
+            if progress_callback: progress_callback(f"Page error: {err.get('error')}")
             break
         soup = BeautifulSoup(resp.text, "html.parser")
         tag, attrs = conf["card"]
         cards = soup.find_all(tag, attrs=attrs)
         if not cards:
-            if progress_callback: progress_callback("Карточки не найдены, остановка.")
-            logger.info("Карточки не найдены на странице %s", page_url)
+            if progress_callback: progress_callback("No cards found, stopping pagination.")
             break
-        if progress_callback: progress_callback(f"Обработка страницы {page}, карточек={len(cards)}")
+        if progress_callback: progress_callback(f"Found {len(cards)} cards on page {page}")
+        # Parallel detail fetching
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = [ex.submit(process_product, extract_card_info(c, conf), delay_details, ignore_robots) for c in cards]
             for f in as_completed(futures):
                 try:
-                    items.append(f.result())
+                    res = f.result()
+                    items.append(res)
                 except Exception as e:
-                    logger.exception("Ошибка товара: %s", e)
-                    if progress_callback: progress_callback(f"Ошибка товара: {e}")
-        time.sleep(delay_pages + random.uniform(0.1, 0.5))
-    logger.info("Обработка завершена. Итемов: %d", len(items))
+                    if progress_callback: progress_callback(f"Product error: {e}")
+        # polite pause
+        time.sleep(delay_pages + random.uniform(0.05, 0.4))
     return items
 
-def detect_site_from_url(url: str) -> Optional[str]:
-    dom = urlparse(url).netloc.lower()
-    if "ozon." in dom: return "ozon"
-    if "wildberries" in dom: return "wildberries"
-    return None
+# ---- Streamlit UI ----
+st.set_page_config(page_title="OZON/Wildberries Scraper", layout="wide")
+st.title("OZON / Wildberries Scraper (Streamlit)")
 
-# ----------------- CLI -----------------
-def run_cli(argv: Optional[List[str]] = None) -> None:
-    import argparse
-    parser = argparse.ArgumentParser(description="Парсинг OZON или Wildberries")
-    parser.add_argument("--url", "-u", help="URL продавца/магазина (если опущен — интерактив)")
-    parser.add_argument("--site", choices=["ozon","wildberries"], help="Ключ сайта (авто-детектится если опущен)")
-    parser.add_argument("--pages", type=int, default=3)
-    parser.add_argument("--delay-pages", type=float, default=1.0)
-    parser.add_argument("--delay-details", type=float, default=1.0)
-    parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--out", default="products.xlsx")
-    parser.add_argument("--ignore-robots", action="store_true", help="Игнорировать robots.txt (не рекомендуется)")
-    parsed = parser.parse_args(argv)
+# Input controls
+col1, col2 = st.columns([2, 1])
+with col1:
+    seller_url = st.text_input("Seller/shop URL")
+    site_choice = st.selectbox("Site", options=["auto", "ozon", "wildberries"], index=0)
+    max_pages = st.number_input("Max pages", min_value=1, max_value=200, value=3)
+    delay_pages = st.number_input("Delay between pages (s)", min_value=0.0, value=1.0, step=0.1)
+    delay_details = st.number_input("Delay between details (s)", min_value=0.0, value=1.0, step=0.1)
+    workers = st.number_input("Threads", min_value=1, max_value=20, value=4)
+    ignore_robots = st.checkbox("Ignore robots.txt (not recommended)", value=False)
+with col2:
+    out_name = st.text_input("Output filename", value="products.xlsx")
+    start_btn = st.button("Start scraping")
+    st.markdown("Notes:")
+    st.markdown("- Selectors are examples; adapt for current site layout.")
+    st.markdown("- Use small page counts & delays to avoid being blocked.")
 
-    url = parsed.url
-    if not url:
-        try:
-            url = input("Введите URL продавца/магазина (или оставить пустым для выхода): ").strip()
-        except Exception:
-            url = ""
-        if not url:
-            logger.info("Не введен URL — выходим.")
-            print("[info] Не введен URL — выходим.")
-            return
+log_box = st.empty()
+result_box = st.empty()
 
-    site = parsed.site or detect_site_from_url(url)
-    if not site:
-        try:
-            site = input("Не удалось определить сайт. Введите 'ozon' или 'wildberries': ").strip().lower()
-        except Exception:
-            site = ""
-        if site not in ("ozon", "wildberries"):
-            logger.error("Недопустимый сайт. Завершение.")
-            print("[error] Недопустимый сайт. Завершение.")
-            return
+def append_log(msg: str) -> None:
+    """Append message to a session_state log and display in log_box."""
+    if "log" not in st.session_state:
+        st.session_state["log"] = []
+    st.session_state["log"].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+    log_box.text_area("Progress log", value="\n".join(st.session_state["log"]), height=240)
 
-    def prog(m): logger.info(m); print("[+]", m)
-
-    items = scrape_seller(url, site, max_pages=parsed.pages, delay_pages=parsed.delay_pages,
-                          delay_details=parsed.delay_details, max_workers=parsed.workers,
-                          progress_callback=prog, ignore_robots=parsed.ignore_robots)
-    if not items:
-        logger.info("Нет товаров или блокировка.")
-        print("[info] Нет товаров или блокировка.")
-        return
-    df = pd.DataFrame(items)
-    try:
-        df.to_excel(parsed.out, index=False, engine="xlsxwriter")
-        logger.info("Сохранено %d товаров в %s", len(df), parsed.out)
-        print("[ok] Сохранено в", parsed.out)
-    except Exception:
-        fallback = parsed.out.rsplit(".", 1)[0] + ".json"
-        with open(fallback, "w", encoding="utf-8") as f:
-            json.dump(items, f, ensure_ascii=False, indent=2)
-        logger.exception("Ошибка при сохранении Excel, сохранен JSON: %s", fallback)
-        print("[warn] Сохранено в JSON:", fallback)
-
-# ----------------- Точка входа -----------------
-if __name__ == "__main__":
-    run_cli(sys.argv[1:])
+if start_btn:
+    # reset logs
+    st.session_state["log"] = []
+    if not seller_url:
+        st.error("Please enter seller/shop URL")
+    else:
+        # detect site if needed
+        site = None if site_choice == "auto" else site_choice
+        if site is None:
+            site = detect_site_from_url(seller_url)
+        if not site:
+            st.error("Could not detect site from URL. Choose 'ozon' or 'wildberries'.")
+        else:
+            append_log(f"Starting scrape for site='{site}' url='{seller_url}'")
+            with st.spinner("Scraping..."):
+                try:
+                    items = scrape_seller(
+                        seller_url=seller_url,
+                        site_key=site,
+                        max_pages=int(max_pages),
+                        delay_pages=float(delay_pages),
+                        delay_details=float(delay_details),
+                        max_workers=int(workers),
+                        progress_callback=append_log,
+                        ignore_robots=ignore_robots,
+                    )
+                except Exception as e:
+                    append_log(f"Fatal error: {e}")
+                    st.exception(e)
+                    items = []
+            if not items:
+                append_log("No items found or scraping failed/blocked.")
+                st.info("No items found or scraping failed/blocked. See log.")
+            else:
+                df = pd.DataFrame(items)
+                append_log(f"Scraped {len(df)} items; preparing output.")
+                result_box.dataframe(df)
+                # prepare excel in-memory
+                buf = io.BytesIO()
+                try:
+                    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+                        df.to_excel(writer, index=False, sheet_name="products")
+                    buf.seek(0)
+                    st.download_button("Download Excel", data=buf.getvalue(), file_name=out_name,
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                except Exception:
+                    # fallback to JSON download
+                    st.download_button("Download JSON", data=json.dumps(items, ensure_ascii=False, indent=2).encode("utf-8"),
+                                       file_name=out_name.rsplit(".", 1)[0] + ".json", mime="application/json")
+                append_log("Done. You may download results.")
