@@ -7,27 +7,26 @@ import json
 import io
 from urllib.parse import urljoin, urlparse
 
-# optional GUI
+# Optional GUI
 try:
     import streamlit as st  # type: ignore
     STREAMLIT_AVAILABLE = True
 except Exception:
     STREAMLIT_AVAILABLE = False
 
-# required libs
+# Required libs; if missing, print instructions and exit gracefully
 try:
     import requests
     from bs4 import BeautifulSoup
     import pandas as pd
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
-except Exception as e:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+except Exception:
     print("Missing required packages. Install with:\n  python -m pip install requests beautifulsoup4 pandas xlsxwriter urllib3")
-    raise
+    sys.exit(1)
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# --------- Config ----------
+# ---------- Config ----------
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
@@ -60,7 +59,7 @@ DOMAIN_RATE = {}
 DOMAIN_LOCK = threading.Lock()
 THREAD_LOCAL = threading.local()
 
-# --------- Network helpers ----------
+# ---------- Network helpers ----------
 def make_session():
     s = requests.Session()
     s.headers.update(DEFAULT_HEADERS)
@@ -76,14 +75,13 @@ def get_thread_session():
     return THREAD_LOCAL.session
 
 def get_robots_text(base_url):
-    """Simple cached retrieval of robots.txt as text (best-effort)."""
     parsed = urlparse(base_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
     with ROBOTS_LOCK:
         if base in ROBOTS_CACHE:
             return ROBOTS_CACHE[base]
     try:
-        r = requests.get(urljoin(base, "/robots.txt"), headers={"User-Agent": USER_AGENTS[0]}, timeout=8)
+        r = requests.get(urljoin(base, "/robots.txt"), headers={"User-Agent": USER_AGENTS[0]}, timeout=6)
         text = r.text if r.status_code == 200 else None
     except Exception:
         text = None
@@ -92,11 +90,9 @@ def get_robots_text(base_url):
     return text
 
 def is_allowed(url):
-    """Best-effort robots check: if robots.txt unavailable -> allow (but rate-limit applies)."""
     txt = get_robots_text(url)
     if not txt:
         return True
-    # simple parser: collect Disallow rules under "User-agent: *"
     lines = [l.strip() for l in txt.splitlines() if l.strip() and not l.strip().startswith("#")]
     ua = None
     disallows = []
@@ -142,7 +138,7 @@ def safe_get(url, delay_between_requests=1.0, timeout=15):
     except requests.RequestException as e:
         return None, {"error": str(e)}
 
-# --------- Parsing helpers ----------
+# ---------- Parsing helpers ----------
 def parse_json_ld(soup):
     data = {}
     for script in soup.find_all("script", type="application/ld+json"):
@@ -176,7 +172,7 @@ def extract_attributes_from_detail_soup(soup):
         text = li.get_text(" ", strip=True)
         if ":" in text:
             try:
-                k,v = map(str.strip, text.split(":",1)); 
+                k,v = map(str.strip, text.split(":",1))
                 if k: attrs.setdefault(k, v)
             except Exception:
                 pass
@@ -237,7 +233,7 @@ def process_product(base_info, delay_details):
         out["detail_error"] = str(details)
     return out
 
-# --------- Scraper ----------
+# ---------- Scraper ----------
 def scrape_seller(seller_url, site_key, max_pages=5, delay_pages=1.0, delay_details=1.0, max_workers=4, progress_callback=None):
     conf = SELECTORS.get(site_key)
     if not conf:
@@ -273,11 +269,11 @@ def detect_site_from_url(url):
     if "wildberries" in dom: return "wildberries"
     return None
 
-# --------- CLI and Streamlit UI ----------
+# ---------- CLI and Streamlit UI ----------
 def run_cli(args=None):
     import argparse
     parser = argparse.ArgumentParser(description="Scrape OZON or Wildberries seller pages")
-    parser.add_argument("url", nargs="?", help="Seller/shop URL (if omitted, will prompt interactively)")
+    parser.add_argument("url", nargs="?", help="Seller/shop URL (omitted -> interactive prompt)")
     parser.add_argument("--site", choices=["ozon","wildberries"], help="Site key (auto-detected if omitted)")
     parser.add_argument("--pages", type=int, default=3)
     parser.add_argument("--delay-pages", type=float, default=1.0)
@@ -288,11 +284,10 @@ def run_cli(args=None):
 
     url = parsed.url
     if not url:
-        # interactive prompt fallback
         try:
             url = input("Enter seller/shop URL: ").strip()
         except Exception:
-            print("No URL provided. Use: python improved_scraper.py <url> or run with --gui")
+            print("No URL provided. Exiting.")
             return
         if not url:
             print("No URL entered. Exiting.")
@@ -300,7 +295,6 @@ def run_cli(args=None):
 
     site = parsed.site or detect_site_from_url(url)
     if not site:
-        # ask interactive
         try:
             site = input("Could not detect site. Enter 'ozon' or 'wildberries': ").strip().lower()
         except Exception:
@@ -328,10 +322,9 @@ def run_cli(args=None):
         print("Failed to save Excel, saved JSON to", fallback, "error:", e)
 
 def run_streamlit():
-    # streamlit app entrypoint
     st.title("Улучшенный парсер OZON и Wildberries")
     url = st.text_input("Seller/shop URL")
-    site_choice = st.selectbox("Site (auto-detect if 'auto')", options=["auto","ozon","wildberries"])
+    site_choice = st.selectbox("Site (auto)", options=["auto","ozon","wildberries"])
     max_pages = st.number_input("Max pages", min_value=1, max_value=200, value=3)
     delay_pages = st.number_input("Delay between pages (s)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
     delay_details = st.number_input("Delay between details (s)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
@@ -346,8 +339,8 @@ def run_streamlit():
             if not site:
                 st.error("Could not detect site. Choose manually.")
                 return
-        prog = st.empty()
-        def progress_callback(m): prog.text(m)
+        prog_area = st.empty()
+        def progress_callback(m): prog_area.text(m)
         with st.spinner("Scraping..."):
             items = scrape_seller(url, site, max_pages=int(max_pages), delay_pages=float(delay_pages),
                                   delay_details=float(delay_details), max_workers=int(workers),
@@ -365,20 +358,18 @@ def run_streamlit():
         st.download_button("Download Excel", data=buf.getvalue(), file_name="products.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# --------- Entrypoint ----------
+# ---------- Entrypoint ----------
 if __name__ == "__main__":
-    # Choose mode:
-    # - If user explicitly requests --gui, attempt to run Streamlit app (requires streamlit installed & run via `streamlit run`).
-    # - If streamlit is available and user used `streamlit run`, the module will be executed and STREAMLIT_AVAILABLE True -> run_streamlit().
-    # - Otherwise run CLI; CLI accepts missing url by prompting interactively.
     args = sys.argv[1:]
     if "--gui" in args:
         if not STREAMLIT_AVAILABLE:
             print("Streamlit is not installed. Install with: python -m pip install streamlit")
             sys.exit(1)
-        run_streamlit()
-    elif STREAMLIT_AVAILABLE and (("streamlit" in " ".join(sys.argv)) or os.environ.get("STREAMLIT_RUNNING") or os.getenv("STREAMLIT_SERVER_RUNNING")):
-        # common when launched by `streamlit run` - run the app
+        # When running with `python script.py --gui` we can't start Streamlit server here;
+        # just inform user how to run it.
+        print("To run the GUI: streamlit run " + os.path.abspath(__file__))
+    elif STREAMLIT_AVAILABLE and ("streamlit" in " ".join(sys.argv) or os.environ.get("STREAMLIT_RUNNING") or os.getenv("STREAMLIT_SERVER_RUNNING")):
+        # Likely invoked via `streamlit run`, start the app
         run_streamlit()
     else:
         # CLI mode (interactive fallback if URL omitted)
