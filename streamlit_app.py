@@ -1,153 +1,158 @@
 import streamlit as st
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import Paragraph, Frame
-from io import BytesIO
+import os
+import pandas as pd
+import io
 from PIL import Image
-import requests
+import glob
+import rembg
 
-# Предположим, есть API маркетплейса (пример)
-API_ENDPOINT = "https://api.marketplace.com/products"
+# Импорт библиотек Google API для работы с Google Drive
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
-st.title("Создание карточки товара с расширенным дизайном и API")
+# Области доступа для работы с Google Drive
+SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
-# Ввод данных
-product_name = st.text_input("Название товара")
-description = st.text_area("Описание товара")
-price = st.number_input("Цена", min_value=0.0, format="%.2f")
-category = st.selectbox("Категория", ["Электроника", "Одежда", "Дом и сад", "Книги", "Другое"])
-stock = st.number_input("Наличие на складе", min_value=0)
-characteristics = st.text_area("Характеристики (по строке)")
+# Функция авторизации и получения сервиса Google Drive
+@st.cache(allow_output_mutation=True)
+def get_drive_service():
+    """
+    Проверяет наличие файла токена, авторизуется или использует существующий.
+    Возвращает объект сервиса Google Drive.
+    """
+    creds = None
+    # Проверка существования файла токена
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    # Если токена нет или он недействителен - авторизация через браузер
+    if not creds or not creds.valid:
+        # Запуск OAuth flow
+        flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+        creds = flow.run_local_server(port=0)
+        # Сохраняем токен для будущего использования
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
+    # Создаем сервис Google Drive
+    service = build('drive', 'v3', credentials=creds)
+    return service
 
-# Загрузка изображений
-images_files = st.file_uploader("Загрузите изображения", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-
-# Имитация API-запроса для получения категорий и характеристик
-def fetch_category_info(category_name):
-    # В реальности тут будет запрос к API
-    return {
-        "id": 123,
-        "name": category_name,
-        "description": f"Описание категории {category_name}"
-    }
-
-category_info = fetch_category_info(category)
-
-# Предварительный просмотр
-if st.button("Показать предварительный просмотр"):
-    st.subheader("Предварительный просмотр карточки")
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        for img in images_files:
-            st.image(img, width=150)
-    with col2:
-        st.markdown(f"## {product_name}")
-        st.markdown(f"**Описание:** {description}")
-        st.markdown(f"**Категория:** {category}")
-        st.markdown(f"**Цена:** ${price:.2f}")
-        st.markdown(f"**Наличие:** {stock}")
-        st.markdown("### Характеристики")
-        for line in characteristics.splitlines():
-            st.markdown(f"- {line}")
-
-# Создаем более сложный дизайн PDF
-def create_advanced_pdf():
-    buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
-
-    # Фон шапки с градиентом (имитация)
-    c.setFillColorRGB(0.2, 0.4, 0.6)
-    c.rect(0, height - 100, width, 100, fill=1)
-
-    # Логотип или логотип маркетплейса
-    # Можно вставить изображение логотипа
-    # c.drawInlineImage("logo.png", 20, height - 80, width=60, height=60)
-
-    # Название товара большими буквами с тенью
-    c.setFillColorRGB(1, 1, 1)
-    c.setFont("Helvetica-Bold", 28)
-    c.drawString(50, height - 50, product_name)
-
-    # Оформление блока с изображениями (с рамкой)
-    y_pos = height - 150
-    x_offset = 50
-    image_size = 120
-    for img in images_files:
-        pil_img = Image.open(img).convert("RGBA")
-        pil_img.thumbnail((image_size, image_size))
-        img_bytes = BytesIO()
-        pil_img.save(img_bytes, format='PNG')
-        img_bytes.seek(0)
-        c.drawInlineImage(img_bytes, x_offset, y_pos - image_size, width=image_size, height=image_size)
-        x_offset += image_size + 20
-        if x_offset + image_size > width - 50:
-            x_offset = 50
-            y_pos -= image_size + 20
-
-    # Описание и характеристики в выделенном блоке
-    styles = getSampleStyleSheet()
-    styleN = styles['BodyText']
-    styleH = styles['Heading2']
-
-    # Создаем параграфы
-    description_para = Paragraph(f"<b>Описание:</b> {description}", styleN)
-    characteristics_para = Paragraph("<b>Характеристики:</b><br/>" + "<br/>".join([f"- {line}" for line in characteristics.splitlines()]), styleN)
-
-    # Рамки для текста
-    frame_desc = Frame(50, y_pos - 200, 500, 150, showBoundary=1)
-    frame_desc.addFromList([description_para], c)
-
-    frame_char = Frame(50, y_pos - 400, 500, 180, showBoundary=1)
-    frame_char.addFromList([characteristics_para], c)
-
-    # Цена и категория
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(50, y_pos - 420, f"Цена: ${price:.2f}")
-    c.drawString(50, y_pos - 440, f"Категория: {category}")
-
-    # Можно добавить дополнительные элементы по дизайну
-
-    c.showPage()
-    c.save()
+# Функция загрузки изображения в папку Google Drive
+def upload_image_to_drive(service, folder_id, image, filename):
+    """
+    Загружает изображение в указанную папку на Google Drive.
+    Делает файл публичным и возвращает публичную ссылку.
+    """
+    buffer = io.BytesIO()
+    image.save(buffer, format='PNG')
     buffer.seek(0)
-    return buffer
-
-# API-запрос для публикации товара
-def publish_to_marketplace(data):
-    # В реальности делается POST-запрос с auth и payload
-    response = requests.post(API_ENDPOINT, json=data)
-    if response.status_code == 201:
-        return True
-    return False
-
-# Кнопка публикации
-if st.button("Опубликовать на маркетплейсе"):
-    # Тут подготовим данные
-    product_data = {
-        "name": product_name,
-        "description": description,
-        "price": price,
-        "category_id": category_info["id"],
-        "stock": stock,
-        "images": [],  # Можно прикреплять URL или base64
+    media = MediaIoBaseUpload(buffer, mimetype='image/png')
+    # Создаем метаданные файла
+    file_metadata = {
+        'name': filename,
+        'parents': [folder_id],
+        'mimeType': 'image/png'
     }
-    # Загруженные изображения можно сохранять или конвертировать
-    # Например, в base64
-    for img in images_files:
-        img_bytes = img.read()
-        encoded = base64.b64encode(img_bytes).decode()
-        product_data["images"].append(encoded)
+    # Загружаем файл
+    file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+    # Делаем файл публичным для доступа по ссылке
+    permission = {
+        'type': 'anyone',
+        'role': 'reader'
+    }
+    service.permissions().create(fileId=file['id'], body=permission).execute()
+    # Возвращаем публичную ссылку
+    return file.get('webViewLink')
 
-    success = publish_to_marketplace(product_data)
-    if success:
-        st.success("Товар успешно опубликован!")
+# Функция получения или создания папки на Google Drive по имени
+def get_or_create_folder(service, folder_name):
+    """
+    Ищет папку по названию. Если не найдена, создает новую.
+    Возвращает ID папки.
+    """
+    query = f"name = '{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    results = service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
+    items = results.get('files', [])
+    if items:
+        return items[0]['id']
     else:
-        st.error("Ошибка публикации. Попробуйте позже.")
+        # Создаем новую папку
+        file_metadata = {
+            'name': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder'
+        }
+        folder = service.files().create(body=file_metadata, fields='id').execute()
+        return folder.get('id')
 
-# Скачать карточку
-if st.button("Скачать расширенную карточку (PDF)"):
-    pdf_buffer = create_advanced_pdf()
-    st.download_button("Скачать PDF", data=pdf_buffer, file_name="advanced_product_card.pdf", mime="application/pdf")
+# Функция для удаления фона у изображения
+def remove_background(image):
+    """
+    Удаляет фон у изображения с помощью библиотеки rembg.
+    Возвращает изображение без фона.
+    """
+    img_bytes = io.BytesIO()
+    image.save(img_bytes, format='PNG')
+    img_bytes = img_bytes.getvalue()
+    result_bytes = rembg.remove(img_bytes)
+    result_img = Image.open(io.BytesIO(result_bytes))
+    return result_img
+
+# Основное приложение
+st.title("Обработка фото товаров с загрузкой в Google Drive")
+
+# Авторизация и создание сервиса Google Drive
+service = get_drive_service()
+
+# Ввод пути к папке с изображениями
+folder_path = st.text_input("Введите путь к папке с фото товара:")
+
+# Обработка по нажатию кнопки
+if st.button("Обработать и загрузить в Google Drive"):
+    if folder_path and os.path.exists(folder_path):
+        # Получаем список изображений из папки
+        images_files = glob.glob(os.path.join(folder_path, "*.*"))
+        if not images_files:
+            st.write("В папке не найдено изображений.")
+        else:
+            data = []
+            # Получаем или создаем папку на Google Drive по имени папки
+            folder_name = os.path.basename(folder_path)
+            folder_id = get_or_create_folder(service, folder_name)
+            # Обрабатываем каждое изображение
+            for path in images_files:
+                try:
+                    name = os.path.basename(path)
+                    # Открываем изображение
+                    img = Image.open(path)
+                    # Показываем оригинал
+                    st.image(img, caption=f"Оригинал: {name}")
+
+                    # Удаление фона
+                    img_no_bg = remove_background(img)
+
+                    # Загрузка в Google Drive и получение публичной ссылки
+                    link = upload_image_to_drive(service, folder_id, img_no_bg, name)
+
+                    # Добавляем в список данных
+                    data.append({"Название": name, "Ссылка": link})
+
+                except Exception as e:
+                    st.write(f"Ошибка с файлом {name}: {e}")
+
+            # Создаем DataFrame и Excel файл
+            df = pd.DataFrame(data)
+            df = df[["Название", "Ссылка"]]
+            excel_bytes = io.BytesIO()
+            df.to_excel(excel_bytes, index=False)
+            excel_bytes.seek(0)
+
+            # Предлагаем скачать Excel
+            st.download_button(
+                label="Скачать Excel с ссылками",
+                data=excel_bytes,
+                file_name="links.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+    else:
+        st.write("Пожалуйста, введите корректный путь к папке.")
