@@ -1,3 +1,13 @@
+Вот полный пример кода для сбора карточек товаров с маркетплейса OZON, включая извлечение характеристик и изображений, с интеграцией в интерфейс Streamlit и сохранением в базу данных SQLite.
+
+**Обратите внимание:**  
+- Вам нужно установить необходимые библиотеки (`playwright`, `streamlit`, `pandas`, `sqlite3` входит в стандартную библиотеку Python).  
+- Перед запуском выполните `playwright install` в командной строке, чтобы установить движки браузеров.  
+- Замените переменную `search_query` и параметры на ваши нужды.
+
+---
+
+```python
 import streamlit as st
 import pandas as pd
 import sqlite3
@@ -65,9 +75,12 @@ def fetch_product_details(product_url):
             try:
                 rows = page.query_selector_all("div[data-testid='product-characteristics'] > div")
                 for row in rows:
-                    key = row.query_selector("div:nth-child(1)").inner_text()
-                    value = row.query_selector("div:nth-child(2)").inner_text()
-                    characteristics[key] = value
+                    key_elem = row.query_selector("div:nth-child(1)")
+                    value_elem = row.query_selector("div:nth-child(2)")
+                    if key_elem and value_elem:
+                        key = key_elem.inner_text()
+                        value = value_elem.inner_text()
+                        characteristics[key] = value
             except:
                 pass
             browser.close()
@@ -79,11 +92,9 @@ def fetch_product_details(product_url):
 # --- Функция для парсинга одного товара ---
 def parse_product(item):
     try:
-        # Извлечение данных из элемента поиска
         title = item.query_selector(".div[@data-testid='product-title']").inner_text()
         price = item.query_selector("[data-testid='price']").inner_text()
         link = item.query_selector("a[data-testid='product-link']").get_attribute("href")
-        # Получение деталей (из кеша или вызова функции)
         image_url, characteristics = fetch_product_details_cached(link)
         return {
             'title': title,
@@ -96,7 +107,7 @@ def parse_product(item):
         logging.error(f"Ошибка при парсинге товара: {e}")
         return None
 
-# --- Асинхронный сбор поисковых результатов ---
+# --- Парсинг результатов поиска ---
 def fetch_search_results(query, max_items=20, max_pages=2):
     results = []
 
@@ -110,7 +121,6 @@ def fetch_search_results(query, max_items=20, max_pages=2):
                 page.goto(url, timeout=60000)
                 time.sleep(3)
                 items = page.query_selector_all("//div[@data-testid='search-result-item']")
-                # Обработка товаров с помощью ThreadPoolExecutor
                 with ThreadPoolExecutor(max_workers=5) as executor:
                     futures = [executor.submit(parse_product, item) for item in items]
                     for future in as_completed(futures):
@@ -127,7 +137,7 @@ def fetch_search_results(query, max_items=20, max_pages=2):
         browser.close()
     return results
 
-# --- Сохранение данных в базу ---
+# --- Сохранение в базу ---
 def save_product_to_db(product, timestamp, query):
     conn = sqlite3.connect('ozon_extended.db')
     c = conn.cursor()
@@ -205,3 +215,9 @@ if st.button("Экспортировать в CSV"):
 if st.button("Экспортировать в JSON"):
     export_data('json')
     st.success("Данные экспортированы в ozon_products_export.json")
+```
+
+---
+
+Этот скрипт собирает карточки товаров с OZON, извлекает характеристики и изображения, сохраняет их в базу и предоставляет интерфейс для поиска и экспорта данных.  
+Обязательно настройте параметры и протестируйте на своих условиях!
