@@ -2,31 +2,28 @@ import streamlit as st
 import pandas as pd
 import time
 import random
+import undetected_chromedriver as uc
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
 
-# Настройка Selenium WebDriver
+# Функция для получения драйвера
 def get_webdriver():
-    options = Options()
-    options.headless = True  # Без GUI
+    options = uc.ChromeOptions()
+    options.headless = False  # Открыть браузер в обычном режиме
     options.add_argument("--disable-blink-features=AutomationControlled")
-    # Можно добавить еще опции для маскировки
-    # options.add_argument("--no-sandbox")
-    # options.add_argument("--disable-dev-shm-usage")
-    # Укажите путь к chromedriver, если он не в PATH
-    service = Service()  # или Service('/path/to/chromedriver')
-    driver = webdriver.Chrome(service=service, options=options)
+    options.add_argument("--start-maximized")
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                         "AppleWebKit/537.36 (KHTML, like Gecko) "
+                         "Chrome/115.0.0.0 Safari/537.36")
+    driver = uc.Chrome(options=options)
     return driver
 
-# Функция для загрузки страницы через Selenium
+# Функция для загрузки страницы
 def fetch_selenium(url):
     driver = get_webdriver()
     try:
-        # Задержка, чтобы сайт успел прогрузиться
         driver.get(url)
-        time.sleep(random.uniform(2, 4))
+        # Имитация поведения человека
+        time.sleep(random.uniform(3, 6))
         html = driver.page_source
         return html
     except Exception as e:
@@ -35,10 +32,11 @@ def fetch_selenium(url):
     finally:
         driver.quit()
 
-# Основной класс
-class MarketplaceScraper:
-    def __init__(self, config):
-        self.config = config
+# Основной класс парсера
+class OzonParser:
+    def __init__(self, catalog_url, max_pages=3):
+        self.catalog_url = catalog_url
+        self.max_pages = max_pages
         self.product_links = []
         self.data = []
 
@@ -47,15 +45,12 @@ class MarketplaceScraper:
         if not html:
             return []
         soup = BeautifulSoup(html, 'html.parser')
-        links = soup.select(self.config['product_link_selector'])
+        links = soup.select('a[data-testid="product-card-title"]')  # селектор для ссылок
         hrefs = []
         for link in links:
             href = link.get('href')
             if href and not href.startswith('http'):
-                base = self.config['base_url']
-                if not base.endswith('/'):
-                    base += '/'
-                href = base + href.lstrip('/')
+                href = 'https://ozon.ru' + href
             hrefs.append(href)
         return hrefs
 
@@ -64,17 +59,12 @@ class MarketplaceScraper:
         if not html:
             return
         soup = BeautifulSoup(html, 'html.parser')
-        name_tag = soup.select_one(self.config['product_name_selector'])
-        price_tag = soup.select_one(self.config['product_price_selector'])
-        image_tag = soup.select_one(self.config['product_image_selector'])
+        name_tag = soup.find('h1', {'data-testid': 'product-title'})
+        price_tag = soup.find('div', {'data-testid': 'price'})
+        image_tag = soup.find('img', {'data-testid': 'product-image'})
         name = name_tag.get_text(strip=True) if name_tag else 'Нет названия'
         price = price_tag.get_text(strip=True) if price_tag else 'Нет цены'
         image = image_tag.get('src') if image_tag else ''
-        if image and not image.startswith('http'):
-            base = self.config['base_url']
-            if not base.endswith('/'):
-                base += '/'
-            image = base + image.lstrip('/')
         self.data.append({
             'Название': name,
             'Цена': price,
@@ -83,48 +73,43 @@ class MarketplaceScraper:
         })
 
     def run(self):
-        for page in range(1, self.config['max_pages'] + 1):
-            page_url = self.config['catalog_url'].replace('{page}', str(page))
+        for page in range(1, self.max_pages + 1):
+            page_url = self.catalog_url.replace('{page}', str(page))
+            st.write(f'Обработка страницы: {page_url}')
             links = self.get_page_links(page_url)
             self.product_links.extend(links)
-        st.write(f'Найдено товаров: {len(self.product_links)}')
+            # Можно добавить задержки между страницами
+            time.sleep(random.uniform(2, 4))
+        st.write(f'Обнаружено товаров: {len(self.product_links)}')
         for url in self.product_links:
+            st.write(f'Обработка товара: {url}')
             self.get_product_details(url)
+            # Небольшая задержка между товарами
+            time.sleep(random.uniform(1, 3))
         return self.data
 
-# Основная функция
+# Основное приложение Streamlit
 def main():
-    st.title("Парсер маркетплейсов с обходом защиты (Selenium)")
+    st.title("Парсер Ozon с обходом защиты")
     st.write("Настраивайте параметры и запускайте.")
 
-    catalog_url = st.text_input("URL каталога (используйте {page})", value='https://пример-маркетплейса.com/каталог?page={page}')
-    base_url = st.text_input("Базовый URL сайта", value='https://пример-маркетплейса.com')
-    product_link_selector = st.text_input("CSS-селектор ссылок на товары", value='a.product-link')
-    product_name_selector = st.text_input("CSS-селектор названия товара", value='h1.product-title')
-    product_price_selector = st.text_input("CSS-селектор цены", value='span.price')
-    product_image_selector = st.text_input("CSS-селектор изображения", value='img.product-image')
-    max_pages = st.number_input("Максимальное число страниц", min_value=1, max_value=50, value=5)
+    catalog_url = st.text_input(
+        "URL каталога (используйте {page} для номера страницы)",
+        value='https://ozon.ru/category/tormoznye-diski-38222/lynxauto-86228624/?page={page}'
+    )
+    max_pages = st.number_input("Максимальное число страниц", min_value=1, max_value=20, value=3)
 
     if st.button("Запустить парсинг"):
-        config = {
-            'catalog_url': catalog_url,
-            'base_url': base_url,
-            'product_link_selector': product_link_selector,
-            'product_name_selector': product_name_selector,
-            'product_price_selector': product_price_selector,
-            'product_image_selector': product_image_selector,
-            'max_pages': max_pages
-        }
-        scraper = MarketplaceScraper(config)
+        parser = OzonParser(catalog_url, max_pages)
         with st.spinner('Парсинг идет...'):
-            data = scraper.run()
-        st.success('Парсинг завершен!')
+            data = parser.run()
         df = pd.DataFrame(data)
+        st.success('Парсинг завершен!')
         st.dataframe(df)
-        # Сохраняем и скачиваем
-        df.to_excel('marketplace_data.xlsx', index=False)
-        with open('marketplace_data.xlsx', 'rb') as f:
-            st.download_button("Скачать Excel", f, "marketplace_data.xlsx", mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        # Сохраняем и даем скачать
+        df.to_excel('ozon_data.xlsx', index=False)
+        with open('ozon_data.xlsx', 'rb') as f:
+            st.download_button("Скачать Excel", f, "ozon_data.xlsx", mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 if __name__ == "__main__":
     main()
