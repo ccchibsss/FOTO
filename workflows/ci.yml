@@ -1,5 +1,6 @@
 name: CI
 
+# Запускать при пуше и Pull Request в ветку main
 on:
   push:
     branches:
@@ -13,30 +14,36 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: [3.10, 3.11]  # выбираем версии Python, совместимые с вашими пакетами
+        python-version: [3.10, 3.11]  # Можно добавить другие версии, если нужно
 
     steps:
+      # Шаг 1: Проверка репозитория
       - name: Checkout репозитория
         uses: actions/checkout@v3
 
+      # Шаг 2: Установка выбранной версии Python
       - name: Установка Python
         uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
 
+      # Шаг 3: Установка системных зависимостей (включая distutils)
       - name: Установка системных зависимостей
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-distutils
 
+      # Шаг 4: Обновление pip
       - name: Обновление pip
         run: |
           python -m pip install --upgrade pip
 
+      # Шаг 5: Установка зависимостей из requirements.txt
       - name: Установка зависимостей
         run: |
           pip install -r requirements.txt
 
+      # Шаг 6: Запуск тестов
       - name: Запуск тестов
         run: |
           pytest
