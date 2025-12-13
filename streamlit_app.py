@@ -1,86 +1,134 @@
-# Проверка и установка distutils, если его нет
+import sys
+import subprocess
+import os
+import io
+import pickle
+import concurrent.futures
+import tempfile
+
+# Проверка и установка distutils/setuptools при необходимости
 try:
     import distutils
 except ModuleNotFoundError:
-    import sys
-    import subprocess
     subprocess.check_call([sys.executable, "-m", "pip", "install", "setuptools"])
-    import distutils
+import torch
 
 import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image, ImageFilter
-import io
-import tempfile
 from moviepy.editor import VideoFileClip, ImageSequenceClip
-from detectron2.engine import DefaultPredictor
-from detectron2.config import get_cfg
-from detectron2 import model_zoo
+
+# --- Вариант 1: detectron2 ---
+try:
+    from detectron2.engine import DefaultPredictor
+    from detectron2.config import get_cfg
+    from detectron2 import model_zoo
+    detectron2_available = True
+except ImportError:
+    detectron2_available = False
+
+# --- Вариант 2: собственная модель ---
 import torch
+from torchvision.models.detection import MaskRCNNPredictor
 
-# Загрузка моделей с настройками порогов
-@st.cache(allow_output_mutation=True)
-def load_mask_rcnn_model(model_name):
-    cfg = get_cfg()
-    cfg.merge_from_file(model_zoo.get_config_file(model_name))
-    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5  # по умолчанию, переопределяется порогом
-    cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(model_name)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    cfg.MODEL.DEVICE = device
-    predictor = DefaultPredictor(cfg)
-    return predictor
+# --- Класс для кастомных моделей ---
+class CustomModel:
+    def __init__(self, model_path, device='cuda'):
+        self.device = device
+        self.model = self.load_model(model_path)
 
-# Поддерживаемые модели
-model_options = {
-    "Mask R-CNN ResNet50": "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml",
-    "Mask R-CNN ResNet101": "COCO-InstanceSegmentation/mask_rcnn_R_101_FPN_3x.yaml"
-}
+    def load_model(self, model_path):
+        model = torch.load(model_path, map_location=self.device)
+        model.to(self.device)
+        model.eval()
+        return model
 
-# Настройки порогов для каждой модели (по умолчанию)
-model_thresholds = {
-    "Mask R-CNN ResNet50": 0.5,
-    "Mask R-CNN ResNet101": 0.5
-}
+    def predict(self, image_cv2):
+        # Предобработка
+        image_rgb = cv2.cvtColor(image_cv2, cv2.COLOR_BGR2RGB)
+        tensor = torch.from_numpy(image_rgb).permute(2,0,1).float() / 255.0
+        with torch.no_grad():
+            outputs = self.model([tensor.to(self.device)])
+        masks = (outputs[0]['masks'] > 0.5).squeeze(1).cpu().numpy()
+        scores = outputs[0]['scores'].cpu().numpy()
+        return list(masks), list(scores)
 
-# Функция обнаружения масок
-def detect_masks(image_cv2, predictor, threshold):
-    outputs = predictor(image_cv2)
-    masks = outputs["instances"].pred_masks.cpu().numpy()
-    scores = outputs["instances"].scores.cpu().numpy()
-    selected_masks = [m for m, s in zip(masks, scores) if s >= threshold]
-    selected_scores = [s for s in scores if s >= threshold]
-    return selected_masks, selected_scores
+# --- Основной класс обработки ---
+class WatermarkProcessor:
+    def __init__(self):
+        # Модели
+        self.models_config = {
+            "Mask R-CNN ResNet50": "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml",
+            "Mask R-CNN ResNet101": "COCO-InstanceSegmentation/mask_rcnn_R_101_FPN_3x.yaml",
+            "Custom Model": None  # путь к вашей модели
+        }
+        self.predictors = {}
+        self.load_models()
+        self.settings = {
+            "model_name": "Mask R-CNN ResNet50",
+            "threshold": 0.5,
+            "replace_mode": "auto",
+            "fill_color": "#000000",
+            "blur_radius": 15,
+            "custom_model_path": None
+        }
 
-# Более сложная автоматическая логика
-def auto_mode_complex(masks, scores, image_shape):
-    if not masks:
-        return "Цвет"
-    
-    total_mask_area = sum(np.sum(mask) for mask in masks)
-    mask_density = total_mask_area / (image_shape[0] * image_shape[1])
-    avg_score = np.mean(scores)
-    max_mask_size = max(np.sum(mask) for mask in masks)
-    normalized_mask_size = max_mask_size / (image_shape[0] * image_shape[1])
-    # Распределение масок по изображению
-    mask_positions = [np.where(mask) for mask in masks]
-    # Можно добавить дополнительные правила по расположению, если нужно
+    def load_models(self):
+        if detectron2_available:
+            for name, config_path in self.models_config.items():
+                if config_path:
+                    self.predictors[name] = self.load_detectron2_model(config_path)
+        # Подгрузка кастомной модели
+        self.custom_model = None
+        if self.settings["model_name"] == "Custom Model" and self.settings["custom_model_path"]:
+            self.custom_model = CustomModel(self.settings["custom_model_path"], device='cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Правила:
-    if mask_density > 0.2:
-        return "Размытие"
-    elif normalized_mask_size < 0.01 and avg_score < 0.5:
-        return "Цвет"
-    elif mask_density > 0.1 and normalized_mask_size > 0.05:
-        return "Размытие"
-    else:
-        return "Цвет"
+    def load_detectron2_model(self, config_path):
+        cfg = get_cfg()
+        cfg.merge_from_file(model_zoo.get_config_file(config_path))
+        cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = self.settings["threshold"]
+        cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(config_path)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        cfg.MODEL.DEVICE = device
+        predictor = DefaultPredictor(cfg)
+        return predictor
 
-def remove_watermarks(image, masks, background_img=None, mode="Цвет", color="#000000", blur_radius=5):
-    image_np = np.array(image)
-    if background_img is not None:
-        background = np.array(background_img.resize(image.size))
-    else:
+    def detect_masks(self, image_cv2, model_name, threshold):
+        if model_name == "Custom Model" and self.custom_model:
+            masks, scores = self.custom_model.predict(image_cv2)
+            return masks, scores
+        elif model_name in self.predictors:
+            predictor = self.predictors[model_name]
+            outputs = predictor(image_cv2)
+            masks = outputs["instances"].pred_masks.cpu().numpy()
+            scores = outputs["instances"].scores.cpu().numpy()
+            selected = [m for m, s in zip(masks, scores) if s >= threshold]
+            selected_scores = [s for s in scores if s >= threshold]
+            return selected, selected_scores
+        else:
+            return [], []
+
+    def auto_decision(self, masks, scores, shape):
+        if not masks:
+            return "Цвет"
+        total_area = sum(np.sum(mask) for mask in masks)
+        mask_density = total_area / (shape[0] * shape[1])
+        max_mask_size = max(np.sum(mask) for mask in masks)
+        max_mask_norm = max_mask_size / (shape[0] * shape[1])
+        avg_score = np.mean(scores)
+
+        if mask_density > 0.2:
+            return "Размытие"
+        elif max_mask_norm < 0.01 and avg_score < 0.5:
+            return "Цвет"
+        elif mask_density > 0.1 and max_mask_norm > 0.05:
+            return "Размытие"
+        else:
+            return "Цвет"
+
+    def remove_watermarks(self, image, masks, mode="Цвет", color="#000000", blur_radius=5):
+        image_np = np.array(image)
         if mode == "Цвет":
             fill_color_rgb = tuple(int(color[i:i+2], 16) for i in (1, 3, 5))
             background = np.full_like(image_np, fill_color_rgb)
@@ -89,122 +137,149 @@ def remove_watermarks(image, masks, background_img=None, mode="Цвет", color=
             blurred = bg_image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
             background = np.array(blurred)
         else:
-            mean_color = np.mean(image_np, axis=(0, 1)).astype(np.uint8)
+            mean_color = np.mean(image_np, axis=(0,1)).astype(np.uint8)
             background = np.full_like(image_np, mean_color)
-    for mask in masks:
-        mask_bool = mask.astype(bool)
-        image_np[mask_bool] = background[mask_bool]
-    return Image.fromarray(image_np)
-
-def process_image(image_bytes, predictor, thresholds, background_img, replace_mode, fill_color, blur_radius):
-    image_cv2 = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
-    selected_model_name = st.session_state['model_name']
-    threshold = thresholds[selected_model_name]
-    masks, scores = detect_masks(image_cv2, predictor, threshold)
-    image_size = image_cv2.shape[:2]
-    # Используем более сложную автоматическую логику
-    auto_mode_choice = auto_mode_complex(masks, scores, image_size)
-    mode = auto_mode_choice if replace_mode == "Авто" else replace_mode
-    
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    # Предварительный просмотр маски
-    if masks:
-        mask_overlay = np.zeros_like(np.array(image))
         for mask in masks:
-            mask_overlay[mask.astype(bool)] = [255, 0, 0]
-        overlay_img = Image.fromarray(mask_overlay).convert("RGBA")
-        preview = image.convert("RGBA")
-        combined = Image.alpha_composite(preview, overlay_img)
-        st.image(combined, caption="Предварительный просмотр маски (красный — водяной знак)")
-        # Подтверждение для удаления
-        if st.button("Удалить водяной знак с этим изображением?"):
-            image = remove_watermarks(image, masks, background_img, mode, fill_color, blur_radius)
-    else:
-        st.info("Водяные знаки не обнаружены.")
+            mask_bool = mask.astype(bool)
+            image_np[mask_bool] = background[mask_bool]
+        return Image.fromarray(image_np)
+
+    def process_image(self, image_bytes, model_name, background_img, replace_mode, fill_color, blur_radius):
+        image_cv2 = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+        threshold = self.settings["threshold"]
+        masks, scores = self.detect_masks(image_cv2, model_name, threshold)
+        shape = image_cv2.shape[:2]
+        auto_mode = self.auto_decision(masks, scores, shape)
+        mode = auto_mode if replace_mode == "auto" else replace_mode
+
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    return image
+        # Предварительный просмотр маски
+        if masks:
+            mask_overlay = np.zeros_like(np.array(image))
+            for mask in masks:
+                mask_overlay[mask.astype(bool)] = [255, 0, 0]
+            overlay_img = Image.fromarray(mask_overlay).convert("RGBA")
+            preview = image.convert("RGBA")
+            combined = Image.alpha_composite(preview, overlay_img)
+            st.image(combined, caption="Маска (красный — водяной знак)")
+            if st.button("Удалить водяной знак с этим изображением?"):
+                image = self.remove_watermarks(image, masks, mode=mode, color=fill_color, blur_radius=blur_radius)
+        else:
+            st.info("Объекты не обнаружены.")
+        return image
 
-def process_video(video_path, predictor, thresholds, background_img, replace_mode, fill_color, blur_radius):
-    clip = VideoFileClip(video_path)
-    processed_frames = []
+    def process_video(self, video_path, background_img, replace_mode, fill_color, blur_radius):
+        clip = VideoFileClip(video_path)
+        frames = list(clip.iter_frames())
 
-    for frame in clip.iter_frames():
-        frame_bytes = cv2.imencode('.jpg', cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))[1].tobytes()
-        processed_frame = process_image(frame_bytes, predictor, thresholds, background_img, replace_mode, fill_color, blur_radius)
-        processed_frames.append(np.array(processed_frame))
-    processed_clip = ImageSequenceClip(processed_frames, fps=clip.fps)
-    output_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-    processed_clip.write_videofile(output_path, codec="libx264", logger=None)
-    return output_path
+        processed_frames = []
 
+        def worker(frame):
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            frame_bytes = cv2.imencode('.jpg', frame_bgr)[1].tobytes()
+            processed_img = self.process_image(frame_bytes, self.settings["model_name"], background_img, replace_mode, fill_color, blur_radius)
+            return np.array(processed_img)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(worker, f) for f in frames]
+            for future in concurrent.futures.as_completed(futures):
+                processed_frames.append(future.result())
+
+        processed_clip = ImageSequenceClip(processed_frames, fps=clip.fps)
+        output_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+        processed_clip.write_videofile(output_path, codec="libx264", logger=None)
+        return output_path
+
+    def save_settings(self, filename='settings.pkl'):
+        with open(filename, 'wb') as f:
+            pickle.dump(self.settings, f)
+
+    def load_settings(self, filename='settings.pkl'):
+        if os.path.exists(filename):
+            with open(filename, 'rb') as f:
+                self.settings = pickle.load(f)
+
+# --- Streamlit UI ---
 def main():
-    st.title("🖼️✨ Расширенное автоматическое удаление водяных знаков")
-    st.markdown("## 🚀 Выбор модели обнаружения")
-    model_name = st.selectbox("Модель обнаружения водяных знаков", list(model_options.keys()))
-    st.session_state['model_name'] = model_name
-    predictor = load_mask_rcnn_model(model_options[model_name])
+    st.title("🖼️✨ Массовая обработка изображений и видео — водяные знаки")
+    processor = WatermarkProcessor()
 
-    # Настройки порогов для каждой модели
-    st.markdown("## 🔧 Настройки порогов для моделей")
-    for m in model_options:
-        default_threshold = model_thresholds.get(m, 0.5)
-        threshold_input = st.slider(f"Порог для {m}", 0.0, 1.0, default_threshold, 0.05)
-        model_thresholds[m] = threshold_input
+    # Выбор модели
+    model_name = st.selectbox("Модель обнаружения водяных знаков", list(processor.models_config.keys()))
+    processor.settings["model_name"] = model_name
 
-    st.markdown("## ⚙️ Настройки обработки")
-    replace_mode = st.selectbox("Режим замещения", ["Цвет", "Размытие", "Авто"])
+    # Загрузка кастомной модели
+    if model_name == "Custom Model":
+        uploaded_model = st.file_uploader("Загрузите вашу модель (.pth)", type=["pth"])
+        if uploaded_model:
+            temp_model_path = os.path.join("models", uploaded_model.name)
+            os.makedirs("models", exist_ok=True)
+            with open(temp_model_path, "wb") as f:
+                f.write(uploaded_model.read())
+            processor.settings["custom_model_path"] = temp_model_path
+            # Перезагружаем модель
+            processor.load_models()
+
+    # Настройки порогов
+    st.markdown("## 🔧 Настройки порогов")
+    for m in processor.models_config:
+        default = processor.settings.get("threshold", 0.5)
+        threshold = st.slider(f"Порог для {m}", 0.0, 1.0, default, 0.05)
+        processor.settings[f"threshold_{m}"] = threshold
+    # Обновляем основной threshold
+    processor.settings["threshold"] = processor.settings.get(f"threshold_{model_name}", 0.5)
+
+    # Остальные параметры
+    replace_mode = st.selectbox("Режим обработки", ["auto", "Цвет", "Размытие"])
     fill_color = st.color_picker("Цвет заливки", "#000000")
-    blur_radius = st.slider("Радиус размытия", 1, 25, 5)
+    blur_radius = st.slider("Радиус размытия", 1, 25, 15)
 
-    st.markdown("## 🖼️ Выбор фона")
-    background_file = st.file_uploader("Загрузите изображение фона", type=["png", "jpg", "jpeg"])
+    # Загрузка фона
+    background_file = st.file_uploader("Фон (опционально)", type=["png", "jpg", "jpeg"])
     background_img = None
     if background_file:
         background_img = Image.open(background_file).convert("RGB")
-        st.image(background_img, caption="Выбранный фон", width=300)
+        st.image(background_img, caption="Выбранный фон", width=200)
 
-    st.markdown("## 📂 Загрузка файлов")
-    uploaded_files = st.file_uploader("Загрузите изображения или видео", type=["png", "jpg", "jpeg", "mp4", "avi"], accept_multiple_files=True)
-
+    # Загрузка файлов
+    uploaded_files = st.file_uploader("Выберите файлы (изображения или видео)", type=["png", "jpg", "jpeg", "mp4"], accept_multiple_files=True)
     if uploaded_files:
-        for uploaded_file in uploaded_files:
-            with st.spinner(f"Обработка файла: {uploaded_file.name}"):
+        for upf in uploaded_files:
+            with st.spinner(f"Обработка {upf.name}"):
                 try:
-                    if uploaded_file.type.startswith("image"):
-                        image_bytes = uploaded_file.read()
-                        result_image = process_image(
-                            image_bytes, predictor, model_thresholds, background_img,
-                            replace_mode=replace_mode,
-                            fill_color=fill_color,
-                            blur_radius=blur_radius
+                    if upf.type.startswith("image"):
+                        image_bytes = upf.read()
+                        result_img = processor.process_image(
+                            image_bytes,
+                            model_name,
+                            background_img,
+                            replace_mode,
+                            fill_color,
+                            blur_radius
                         )
-                        st.image(result_image, caption=f"Обработанное {uploaded_file.name}")
+                        st.image(result_img)
                         buf = io.BytesIO()
-                        result_image.save(buf, format="PNG")
-                        st.download_button(
-                            label="Скачать изображение",
-                            data=buf.getvalue(),
-                            file_name=f"processed_{uploaded_file.name}.png"
-                        )
-                    elif uploaded_file.type.startswith("video"):
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp:
-                            temp.write(uploaded_file.read())
-                            video_path = temp.name
-                        processed_video_path = process_video(
-                            video_path, predictor, model_thresholds, background_img,
-                            replace_mode=replace_mode,
-                            fill_color=fill_color,
-                            blur_radius=blur_radius
-                        )
-                        st.video(processed_video_path)
-                        with open(processed_video_path, "rb") as f:
-                            st.download_button(
-                                label="Скачать видео",
-                                data=f.read(),
-                                file_name=f"processed_{uploaded_file.name}"
-                            )
+                        result_img.save(buf, format="PNG")
+                        st.download_button("Скачать изображение", buf.getvalue(), file_name=f"processed_{upf.name}.png")
+                    elif upf.type.startswith("video"):
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_in:
+                            tmp_in.write(upf.read())
+                            video_path = tmp_in.name
+                        output_path = processor.process_video(video_path, background_img, replace_mode, fill_color, blur_radius)
+                        st.video(output_path)
+                        with open(output_path, "rb") as f:
+                            st.download_button("Скачать видео", f.read(), file_name=f"processed_{upf.name}")
                 except Exception as e:
-                    st.error(f"Ошибка при обработке {uploaded_file.name}: {e}")
+                    st.error(f"Ошибка: {e}")
+
+    # Сохранение/загрузка настроек
+    if st.button("Сохранить настройки"):
+        processor.save_settings()
+        st.success("Настройки сохранены")
+    if st.button("Загрузить настройки"):
+        processor.load_settings()
+        st.success("Настройки загружены")
+        st.json(processor.settings)
 
 if __name__ == "__main__":
     main()
