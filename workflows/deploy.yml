@@ -13,6 +13,11 @@ jobs:
       - name: Checkout репозитория
         uses: actions/checkout@v3
 
+      - name: Установить системные пакеты
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-distutils
+
       - name: Установить Python
         uses: actions/setup-python@v4
         with:
@@ -22,14 +27,17 @@ jobs:
         run: |
           python -m venv venv
 
-      - name: Обновить pip и установить зависимости
+      - name: Обновить pip, setuptools и wheel
         run: |
           source venv/bin/activate
-          pip install --upgrade pip
+          pip install --upgrade pip setuptools wheel
+
+      - name: Установить зависимости
+        run: |
+          source venv/bin/activate
           pip install -r requirements.txt
 
       - name: Запустить Streamlit приложение
         run: |
           source venv/bin/activate
           streamlit run app.py
-        # Можно добавить условие для запуска только в определенных случаях
