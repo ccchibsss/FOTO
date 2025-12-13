@@ -1,43 +1,36 @@
-name: Deploy Streamlit App
+name: CI
 
 on:
   push:
     branches:
-      - main  # запускать при пуше в main
+      - main
+  pull_request:
+    branches:
+      - main
 
 jobs:
-  build-and-deploy:
+  build:
     runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: [3.10, 3.11]  # Укажите нужные версии Python
 
     steps:
       - name: Checkout репозитория
         uses: actions/checkout@v3
 
-      - name: Установить системные пакеты
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-distutils
-
-      - name: Установить Python
+      - name: Установка Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.13'
+          python-version: ${{ matrix.python-version }}
 
-      - name: Создать виртуальную среду
+      - name: Установка зависимостей
         run: |
-          python -m venv venv
-
-      - name: Обновить pip, setuptools и wheel
-        run: |
-          source venv/bin/activate
-          pip install --upgrade pip setuptools wheel
-
-      - name: Установить зависимости
-        run: |
-          source venv/bin/activate
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Запустить Streamlit приложение
+      - name: Запуск тестов
         run: |
-          source venv/bin/activate
-          streamlit run app.py
+          # Здесь можно добавить команду для запуска ваших тестов
+          pytest
