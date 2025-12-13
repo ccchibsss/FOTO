@@ -1,3 +1,12 @@
+# Проверка и установка distutils, если его нет
+try:
+    import distutils
+except ModuleNotFoundError:
+    import sys
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "setuptools"])
+    import distutils
+
 import streamlit as st
 import cv2
 import numpy as np
