@@ -1,0 +1,35 @@
+name: Deploy Streamlit App
+
+on:
+  push:
+    branches:
+      - main  # запускать при пуше в main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout репозитория
+        uses: actions/checkout@v3
+
+      - name: Установить Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.13'
+
+      - name: Создать виртуальную среду
+        run: |
+          python -m venv venv
+
+      - name: Обновить pip и установить зависимости
+        run: |
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Запустить Streamlit приложение
+        run: |
+          source venv/bin/activate
+          streamlit run app.py
+        # Можно добавить условие для запуска только в определенных случаях
