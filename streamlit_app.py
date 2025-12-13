@@ -6,12 +6,48 @@ import pickle
 import concurrent.futures
 import tempfile
 
-# Проверка и установка distutils/setuptools при необходимости
-try:
-    import distutils
-except ModuleNotFoundError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "setuptools"])
+def install_package(package_name):
+    """Устанавливает пакет через pip"""
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", package_name])
 
+def check_and_install_dependencies():
+    """Проверяет и устанавливает необходимые зависимости без distutils"""
+    # Проверка и установка setuptools и wheel
+    try:
+        import setuptools
+        import wheel
+    except ModuleNotFoundError:
+        print("Установка setuptools и wheel...")
+        install_package("setuptools")
+        install_package("wheel")
+    else:
+        print("Обновление setuptools и wheel...")
+        install_package("setuptools")
+        install_package("wheel")
+    
+    # Обновление pip
+    print("Обновление pip...")
+    install_package("pip")
+    
+    # Попытка установить torch
+    try:
+        import torch
+        print("PyTorch уже установлен.")
+    except ImportError:
+        print("PyTorch не установлен. Попытка установки...")
+        try:
+            install_package("torch")
+            import torch
+            print("PyTorch успешно установлен.")
+        except Exception as e:
+            print(f"Ошибка установки torch: {e}")
+            print("Возможно, для вашей версии Python wheel для torch отсутствует.")
+            print("Рекомендуется использовать Python 3.10 или 3.11 или установить torch вручную из https://pytorch.org/")
+
+if __name__ == "__main__":
+    check_and_install_dependencies()
+
+# Далее ваш оригинальный код
 import torch
 import streamlit as st
 import cv2
@@ -44,7 +80,6 @@ class CustomModel:
         return model
 
     def predict(self, image_cv2):
-        # Предобработка изображения
         image_rgb = cv2.cvtColor(image_cv2, cv2.COLOR_BGR2RGB)
         tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).float() / 255.0
         with torch.no_grad():
@@ -74,7 +109,6 @@ class WatermarkProcessor:
         }
 
     def load_models(self):
-        # Загрузка detectron2 моделей
         if detectron2_available:
             for name, config_path in self.models_config.items():
                 if config_path:
