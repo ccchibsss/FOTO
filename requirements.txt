@@ -4,4 +4,3 @@ numpy==1.23.5
 Pillow==9.4.0
 moviepy==1.0.3
 torch==2.0.1
-detectron2 @ git+https://github.com/facebookresearch/detectron2.git@main
