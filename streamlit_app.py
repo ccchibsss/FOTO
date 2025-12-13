@@ -11,8 +11,8 @@ try:
     import distutils
 except ModuleNotFoundError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "setuptools"])
-import torch
 
+import torch
 import streamlit as st
 import cv2
 import numpy as np
@@ -29,7 +29,6 @@ except ImportError:
     detectron2_available = False
 
 # --- Вариант 2: собственная модель ---
-import torch
 from torchvision.models.detection import MaskRCNNPredictor
 
 # --- Класс для кастомных моделей ---
@@ -45,9 +44,9 @@ class CustomModel:
         return model
 
     def predict(self, image_cv2):
-        # Предобработка
+        # Предобработка изображения
         image_rgb = cv2.cvtColor(image_cv2, cv2.COLOR_BGR2RGB)
-        tensor = torch.from_numpy(image_rgb).permute(2,0,1).float() / 255.0
+        tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).float() / 255.0
         with torch.no_grad():
             outputs = self.model([tensor.to(self.device)])
         masks = (outputs[0]['masks'] > 0.5).squeeze(1).cpu().numpy()
@@ -57,7 +56,7 @@ class CustomModel:
 # --- Основной класс обработки ---
 class WatermarkProcessor:
     def __init__(self):
-        # Модели
+        # Конфигурация моделей
         self.models_config = {
             "Mask R-CNN ResNet50": "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml",
             "Mask R-CNN ResNet101": "COCO-InstanceSegmentation/mask_rcnn_R_101_FPN_3x.yaml",
@@ -75,11 +74,12 @@ class WatermarkProcessor:
         }
 
     def load_models(self):
+        # Загрузка detectron2 моделей
         if detectron2_available:
             for name, config_path in self.models_config.items():
                 if config_path:
                     self.predictors[name] = self.load_detectron2_model(config_path)
-        # Подгрузка кастомной модели
+        # Загрузка кастомной модели
         self.custom_model = None
         if self.settings["model_name"] == "Custom Model" and self.settings["custom_model_path"]:
             self.custom_model = CustomModel(self.settings["custom_model_path"], device='cuda' if torch.cuda.is_available() else 'cpu')
@@ -103,9 +103,9 @@ class WatermarkProcessor:
             outputs = predictor(image_cv2)
             masks = outputs["instances"].pred_masks.cpu().numpy()
             scores = outputs["instances"].scores.cpu().numpy()
-            selected = [m for m, s in zip(masks, scores) if s >= threshold]
-            selected_scores = [s for s in scores if s >= threshold]
-            return selected, selected_scores
+            selected_masks = [mask for mask, score in zip(masks, scores) if score >= threshold]
+            selected_scores = [score for score in scores if score >= threshold]
+            return selected_masks, selected_scores
         else:
             return [], []
 
@@ -137,7 +137,7 @@ class WatermarkProcessor:
             blurred = bg_image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
             background = np.array(blurred)
         else:
-            mean_color = np.mean(image_np, axis=(0,1)).astype(np.uint8)
+            mean_color = np.mean(image_np, axis=(0, 1)).astype(np.uint8)
             background = np.full_like(image_np, mean_color)
         for mask in masks:
             mask_bool = mask.astype(bool)
@@ -185,6 +185,7 @@ class WatermarkProcessor:
             for future in concurrent.futures.as_completed(futures):
                 processed_frames.append(future.result())
 
+        processed_frames = [Image.fromarray(frame) for frame in processed_frames]
         processed_clip = ImageSequenceClip(processed_frames, fps=clip.fps)
         output_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
         processed_clip.write_videofile(output_path, codec="libx264", logger=None)
@@ -212,8 +213,8 @@ def main():
     if model_name == "Custom Model":
         uploaded_model = st.file_uploader("Загрузите вашу модель (.pth)", type=["pth"])
         if uploaded_model:
-            temp_model_path = os.path.join("models", uploaded_model.name)
             os.makedirs("models", exist_ok=True)
+            temp_model_path = os.path.join("models", uploaded_model.name)
             with open(temp_model_path, "wb") as f:
                 f.write(uploaded_model.read())
             processor.settings["custom_model_path"] = temp_model_path
