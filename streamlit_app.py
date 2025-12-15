@@ -1,215 +1,401 @@
-import streamlit as st
 import os
 import tempfile
-import threading
 import glob
-import cv2
-import numpy as np
-from PIL import Image, ImageDraw
-import torch
-import subprocess
+import atexit
 import platform
+import subprocess
+import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
 
-from lama_cleaner.model_manager import ModelManager
-from lama_cleaner.schema import Config, HDStrategy, LDMSampler
-from transformers import AutoProcessor, AutoModelForCausalLM
+import streamlit as st
+from PIL import Image, ImageDraw, ImageFilter
+import numpy as np
+import cv2
+import torch
+from torch.cuda import amp
 
-# --- Установка зависимостей и системных библиотек ---
-@st.cache(allow_output_mutation=True)
-def install_dependencies():
+# Внешние зависимости
+try:
+    from lama_cleaner.model_manager import ModelManager
+    from lama_cleaner.schema import Config, HDStrategy, LDMSampler
+    from transformers import AutoProcessor, AutoModelForCausalLM
+    import onnxruntime  # Для YOLO
+except Exception as e:
+    ModelManager = None
+    Config = None
+    HDStrategy = None
+    LDMSampler = None
+    AutoProcessor = None
+    AutoModelForCausalLM = None
+    _IMPORT_ERROR = e
+else:
+    _IMPORT_ERROR = None
+
+# Настройка логирования
+logging.basicConfig(
+    filename='watermark_remover.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# ---------- Утилиты ----------
+def safe_run(cmd_list, env=None):
+    """Запустить команду безопасно."""
+    try:
+        result = subprocess.run(cmd_list, check=True, env=env, capture_output=True, text=True)
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        logging.error(f!Команда не выполнена: {e.stderr}")
+        return None
+
+@st.cache_resource(show_spinner=False)
+def install_minimal_dependencies():
+    """Установка системных пакетов."""
     system = platform.system()
     if system == "Linux":
-        # Для Linux
-        try:
-            subprocess.run('apt-get update', shell=True, check=True)
-            subprocess.run('apt-get install -y libgl1-mesa-glx', shell=True, check=True)
-        except Exception:
-            # Можно логировать ошибку или показывать сообщение
-            pass
-    elif system == "Windows":
-        # Для Windows
-        st.info(
-            "На Windows рекомендуется обновить драйвер видеокарты и установить последние версии DirectX "
-            "для корректной работы. Обновите драйверы видеокарты через сайт производителя."
-        )
-    else:
-        # Для других систем (macOS и т.п.) — ничего не делаем
-        pass
+        safe_run(["apt-get", "update"])
+        safe_run(["apt-get", "install", "-y", "libgl1-mesa-glx", "ffmpeg"])
+    return True
 
-    # Установка Python-библиотек
-    try:
-        subprocess.run('pip install flash-attn --no-build-isolation', env={'FLASH_ATTENTION_SKIP_CUDA_BUILD': "TRUE"}, shell=True, check=True)
-    except subprocess.CalledProcessError:
-        # Можно логировать ошибку или показывать сообщение
-        pass
+install_minimal_dependencies()
 
-# Вызываем установку один раз при запуске
-install_dependencies()
-
-# --- Классы моделей ---
+# ---------- Улучшенные модели ----------
 class FlorenceModel:
-    def __init__(self, model_id):
+    def __init__(self, model_id: str, precision: str = "float32"):
+        if _IMPORT_ERROR:
+            raise RuntimeError(f"Библиотеки не установлены: {_IMPORT_ERROR}")
+        
         self.model_id = model_id
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True).to(self.device).eval()
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.precision = precision
+        
+        # Загрузка с mixed precision
+        dtype = torch.float16 if precision == "float16" else torch.float32
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            torch_dtype=dtype
+        ).to(self.device).eval()
+        
         self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 
-class WatermarkRemover:
-    def __init__(self, model: FlorenceModel):
-        self.model = model
-        self.model_manager = ModelManager(name="lama", device=self.model.device)
+@st.cache_resource
+def get_florence_model(model_id: str, precision: str):
+    return FlorenceModel(model_id, precision)
 
-    def process_image(self, image, mask, strategy=HDStrategy.RESIZE, sampler=LDMSampler.ddim, fx=1, fy=1):
-        image_cv = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        mask_cv = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
-        if fx != 1 or fy != 1:
-            image_cv = cv2.resize(image_cv, None, fx=fx, fy=fy, interpolation=cv2.INTER_AREA)
-            mask_cv = cv2.resize(mask_cv, None, fx=fx, fy=fy, interpolation=cv2.INTER_NEAREST)
-        config = Config(
-            ldm_steps=1,
-            ldm_sampler=sampler,
-            hd_strategy=strategy,
-            hd_strategy_crop_margin=32,
-            hd_strategy_crop_trigger_size=200,
-            hd_strategy_resize_limit=200,
+class WatermarkRemover:
+    def __init__(self, florence_model: FlorenceModel, use_gpu: bool = True):
+        if _IMPORT_ERROR:
+            raise RuntimeError(f"Библиотеки не установлены: {_IMPORT_ERROR}")
+            
+        self.model = florence_model
+        self.use_gpu = use_gpu and torch.cuda.is_available()
+        
+        # Модель для уточнения маски
+        self.yolo_model = None  # Загрузить при необходимости
+        
+        self.model_manager = ModelManager(
+            name="lama",
+            device=self.model.device,
+            fp16=self.use_gpu
         )
-        result = self.model_manager(image_cv, mask_cv, config)
+
+    def _preprocess_mask(self, mask_cv: np.ndarray) -> np.ndarray:
+        """Улучшенная обработка маски."""
+        # Морфологические операции
+        kernel = np.ones((3, 3), np.uint8)
+        mask_cv = cv2.morphologyEx(mask_cv, cv2.MORPH_CLOSE, kernel)
+        mask_cv = cv2.dilate(mask_cv, kernel, iterations=1)
+        
+        # Размытие границ
+        mask_cv = cv2.GaussianBlur(mask_cv, (5, 5), 0)
+        return mask_cv
+
+    def process_image(self, image_cv: np.ndarray, mask_cv: np.ndarray, **kwargs) -> np.ndarray:
+        """Обработка с mixed precision."""
+        with amp.autocast(enabled=self.use_gpu):
+            config = Config(
+                ldm_steps=kwargs.get("steps", 20),
+                ldm_sampler=kwargs.get("sampler", LDMSampler.ddim),
+                hd_strategy=kwargs.get("strategy", HDStrategy.RESIZE),
+                hd_strategy_crop_margin=kwargs.get("margin", 32),
+                hd_strategy_crop_trigger_size=kwargs.get("trigger", 200),
+                hd_strategy_resize_limit=kwargs.get("limit", 512),
+            )
+            result = self.model_manager(image_cv, mask_cv, config)
         return result
 
-    def create_mask(self, image, prediction):
-        mask = Image.new("RGBA", image.size, (0, 0, 0, 255))
+    def create_mask(self, image_pil: Image.Image, prediction: dict) -> Image.Image:
+        """Создание маски с пост‑обработкой."""
+        mask = Image.new("L", image_pil.size, 0)
         draw = ImageDraw.Draw(mask)
-        scale = 1
-        for polygons in prediction.get('polygons', []):
-            for _polygon in polygons:
-                _polygon = np.array(_polygon).reshape(-1, 2)
-                if len(_polygon) < 3:
+        
+        for polygons in prediction.get("polygons", []):
+            for poly in polygons:
+                arr = np.array(poly).reshape(-1, 2)
+                if len(arr) < 3:
                     continue
-                _polygon = (_polygon * scale).reshape(-1).tolist()
-                draw.polygon(_polygon, fill=(255, 255, 255, 255))
+                coords = [tuple(map(float, xy)) for xy in arr]
+                draw.polygon(coords, fill=255)
+        
+        # Размытие маски для плавного перехода
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=2))
         return mask
 
-    def run_florence_segmentation(self, image):
-        if isinstance(image, np.ndarray):
-            image_pil = Image.fromarray(image)
-        else:
-            image_pil = image
-        text_input = 'watermark'
-        task_prompt = '<REGION_TO_SEGMENTATION>'
-        inputs = self.model.processor(text=task_prompt + text_input, images=image_pil, return_tensors="pt").to(self.model.device)
-        generated_ids = self.model.model.generate(
-            input_ids=inputs["input_ids"],
-            pixel_values=inputs["pixel_values"],
-            max_new_tokens=1024,
-            early_stopping=False,
-            do_sample=False,
-            num_beams=3,
-        )
-        generated_text = self.model.processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-        parsed_answer = self.model.processor.post_process_generation(
+    def run_florence_segmentation(self, image: Image.Image) -> dict:
+        """Сегментация с улучшенной обработкой."""
+        text_input = "watermark"
+        task_prompt = "<REGION_TO_SEGMENTATION>"
+        
+        inputs = self.model.processor(
+            text=task_prompt + text_input,
+            images=image,
+            return_tensors="pt"
+        ).to(self.model.device)
+
+        with torch.no_grad():
+            generated_ids = self.model.model.generate(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=1024,
+                do_sample=False,
+                num_beams=3,
+                early_stopping=True
+            )
+
+        generated_text = self.model.processor.batch_decode(
+            generated_ids, skip_special_tokens=False
+        )[0]
+
+        parsed = self.model.processor.post_process_generation(
             generated_text,
             task=task_prompt,
-            image_size=(image_pil.width, image_pil.height)
+            image_size=(image.width, image.height)
         )
-        return parsed_answer.get('<REGION_TO_SEGMENTATION>', {})
+        return parsed.get("<REGION_TO_SEGMENTATION>", {})
 
-    def process_florence_image(self, image_path, output_path):
-        image = Image.open(image_path).convert("RGB")
-        image_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-        prediction = self.run_florence_segmentation(image)
-        mask_image = self.create_mask(image, prediction)
-        result = self.process_image(image_cv, np.array(mask_image), HDStrategy.RESIZE, LDMSampler.ddim)
-        result_pil = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
-        result_pil.save(output_path)
-        return output_path
+    def process_image_advanced(self, image_path: str, output_path: str, **options) -> str:
+        """Расширенная обработка с настройками."""
+        try:
+            image = Image.open(image_path).convert("RGB")
+            image_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
 
-# --- Основная логика ---
+            # Сегментация
+            prediction = self.run_florence_segmentation(image)
+            mask_pil = self.create_mask(image, prediction)
+            mask_cv = np.array(mask_pil)
+
+            if mask_cv.ndim == 2:
+                mask_cv = cv2.cvtColor(mask_cv, cv2.COLOR_GRAY2BGR)
+
+            # Улучшение маски
+            mask_cv = self._preprocess_mask(mask_cv)
+
+            # Обработка
+            result_cv = self.process_image(
+                image_cv,
+                mask_cv,
+                steps=options.get("steps", 20),
+                sampler=options.get("sampler", LDMSampler.ddim),
+                strategy=options.get("strategy", HDStrategy.RESIZE)
+            )
+
+                        result_pil = Image.fromarray(cv2.cvtColor(result_cv, cv2.COLOR_BGR2RGB))
+            
+            # Сохранение
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            result_pil.save(output_path, quality=95, optimize=True)
+            return output_path
+
+        except Exception as e:
+            logging.error(f"Ошибка обработки {image_path}: {e}")
+            raise
+
+# ---------- Streamlit UI ----------
 def main():
-    # Модельные опции
+    st.set_page_config(page_title="Watermark Remover Pro", layout="wide")
+    st.title("Удаление водяных знаков — Pro-версия")
+
+    if _IMPORT_ERROR:
+        st.error(f"""
+        Необходимые библиотеки не установлены: {_IMPORT_ERROR}
+        
+        **Как исправить:**
+        1. Установите зависимости:  
+           ```bash
+           pip install lama-cleaner transformers onnxruntime-gpu
+           ```
+        2. Перезапустите приложение.
+        """)
+        return
+
+    # Настройки обработки
+    st.sidebar.header("Настройки")
     model_choices = [
-        'microsoft/Florence-2-base',
-        'microsoft/Florence-2-base-ft',
-        'microsoft/Florence-2-large',
-        'microsoft/Florence-2-large-ft'
+        "microsoft/Florence-2-base",
+        "microsoft/Florence-2-base-ft",
+        "microsoft/Florence-2-large",
+        "microsoft/Florence-2-large-ft",
     ]
+    selected_model = st.sidebar.selectbox(
+        "Модель Florence", model_choices, index=2
+    )
+    
+    precision = st.sidebar.radio(
+        "Точность вычислений", ["float32", "float16"], index=1
+        if torch.cuda.is_available() else 0
+    )
+    
+    use_gpu = st.sidebar.checkbox("Использовать GPU", value=torch.cuda.is_available())
+    
+    # Расширенные параметры
+    st.sidebar.subheader("Параметры удаления")
+    steps = st.sidebar.slider("Шаги LDM", 1, 50, 20)
+    strategy = st.sidebar.selectbox(
+        "Стратегия HD", [HDStrategy.RESIZE, HDStrategy.CROP, HDStrategy.NONE]
+    )
+    
+    with st.spinner("Загрузка модели..."):
+        try:
+            florence = get_florence_model(selected_model, precision)
+            remover = WatermarkRemover(florence, use_gpu)
+        except Exception as e:
+            st.error(f"Ошибка загрузки модели: {e}")
+            return
 
-    # Кеш моделей
-    models_cache = {}
-    for m_id in model_choices:
-        models_cache[m_id] = FlorenceModel(m_id)
+    # Основной интерфейс
+    st.markdown("### 1. Обработка одного изображения")
+    uploaded = st.file_uploader(
+        "Загрузите изображение (PNG/JPG)", type=["png", "jpg", "jpeg"]
+    )
+    
+    if uploaded:
+        # Временный файл
+        tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded.name.split('.')[-1]}")
+        tmp_in.write(uploaded.read())
+        tmp_in.flush()
+        tmp_in.close()
+        atexit.register(lambda: safe_remove(tmp_in.name))
 
-    def get_remover(model_id):
-        return WatermarkRemover(models_cache[model_id])
+        try:
+            img = Image.open(tmp_in.name).convert("RGB")
+            st.image(img, caption="Оригинал", use_column_width=True)
+        except Exception as e:
+            st.error(f"Ошибка открытия: {e}")
+            safe_remove(tmp_in.name)
+            return
 
-    st.title("Удаление водяных знаков с изображений")
-    st.write("Выберите модель Florence для сегментации и загрузите изображение.")
-
-    # Выбор модели
-    selected_model_id = st.selectbox("Модель Florence", options=model_choices, index=2)
-
-    # Загрузка файла
-    uploaded_file = st.file_uploader("Загрузите изображение", type=["png", "jpg", "jpeg"])
-
-    if uploaded_file:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_input:
-            input_path = temp_input.name
-            uploaded_file.seek(0)
-            temp_input.write(uploaded_file.read())
-
-        remover = get_remover(selected_model_id)
-
-        # Отображение загруженного изображения
-        original_img = Image.open(input_path)
-        st.image(original_img, caption='Загруженное изображение', use_column_width=True)
-
-        # Обработка по кнопке
-        if st.button("Удалить водяной знак"):
-            with st.spinner('Обработка изображения...'):
+        if st.button("Удалить водяной знак", key="single_process"):
+            out_path = tmp_in.name.rsplit(".", 1)[0] + "_clean.png"
+            with st.spinner("Обработка..."):
                 try:
-                    output_path = input_path.replace('.jpg', '_result.png').replace('.png', '_result.png')
-                    remover.process_florence_image(input_path, output_path)
-                    result_img = Image.open(output_path)
-                    st.image(result_img, caption='Обработанное изображение', use_column_width=True)
+                    remover.process_image_advanced(
+                        tmp_in.name,
+                        out_path,
+                        steps=steps,
+                        strategy=strategy
+                    )
+                    st.success("Готово!")
+                    
+                    # Сравнение
+                    col1, col2 = st.columns(2)
+                    col1.image(img, caption="До")
+                    col2.image(Image.open(out_path), caption="После")
+                    
+                    # Кнопка скачивания
+                    with open(out_path, "rb") as file:
+                        st.download_button(
+                            label="Скачать результат",
+                            data=file,
+                            file_name=f!cleaned_{uploaded.name}",
+                            mime="image/png"
+                        )
+                        
                 except Exception as e:
                     st.error(f"Ошибка: {e}")
+                    logging.exception(e)
 
-        # Очистка временных файлов
-        def cleanup():
-            try:
-                os.remove(input_path)
-                os.remove(output_path)
-            except:
-                pass
-        st.on_event("close", cleanup)
+    st.markdown("---")
+    st.markdown("### 2. Пакетная обработка")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        input_folder = st.text_input("Входная папка", value="")
+    with col2:
+        output_folder = st.text_input("Папка для результатов", value="")
 
-    # --- Пакетная обработка ---
-    st.write("---")
-    st.subheader("Пакетная обработка папки")
-    folder_path = st.text_input("Путь к папке с изображениями")
-    output_folder = st.text_input("Путь к папке для сохранения")
-    max_workers = st.number_input("Число потоков", min_value=1, max_value=8, value=4)
-
-    if st.button("Обработать папку"):
-        if folder_path and output_folder:
-            files = glob.glob(os.path.join(folder_path, "*.*"))
-            total_files = len(files)
-            st.write(f"Обработка {total_files} изображений...")
-
-            def process_batch():
-                for idx, file_path in enumerate(files, 1):
-                    filename = os.path.basename(file_path)
-                    out_path = os.path.join(output_folder, filename)
-                    try:
-                        remover = get_remover(selected_model_id)
-                        remover.process_florence_image(file_path, out_path)
-                    except Exception as e:
-                        st.write(f"Ошибка при обработке {filename}: {e}")
-                    st.progress(idx / total_files)
-                st.success("Обработка завершена!")
-
-            threading.Thread(target=process_batch).start()
+    max_workers = st.slider("Потоки", 1, 8, 4)
+    
+    if st.button("Запустить обработку", key="batch_process"):
+        if not input_folder or not output_folder:
+            st.error("Укажите обе папки!")
+            return
+            
+        files = [
+            p for p in glob.glob(os.path.join(input_folder, "*.*"))
+            if p.lower().endswith((".png", ".jpg", ".jpeg"))
+        ]
+        
+        if not files:
+            st.info("Нет изображений для обработки.")
+            return
+            
+        total = len(files)
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        error_list = []
+        
+        os.makedirs(output_folder, exist_ok=True)
+        
+        # Пакетная обработка
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    remover.process_image_advanced,
+                    path,
+                    os.path.join(
+                        output_folder,
+                        f"{Path(path).stem}_clean.png"
+                    ),
+                    steps=steps,
+                    strategy=strategy
+                ): path
+                for path in files
+            }
+            
+            completed = 0
+            for future in as_completed(futures):
+                path = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    error_list.append(f"{path}: {str(e)}")
+                
+                completed += 1
+                progress_bar.progress(completed / total)
+                status_text.text(f"Обработано: {completed}/{total}")
+        
+        # Итоги
+        if error_list:
+            st.error(f"Ошибки ({len(error_list)}):")
+            for err in error_list[:10]:
+                st.code(err)
         else:
-            st.error("Пожалуйста, укажите пути к папкам.")
+            st.success(f"Готово! Обработано {total} изображений.")
+
+        # Логи
+        st.markdown("#### Логи обработки")
+        log_file = Path("watermark_remover.log")
+        if log_file.exists():
+            st.text(log_file.read_text()[-2000:])  # Последние 2000 символов
+
+def safe_remove(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        logging.warning(f"Не удалось удалить {path}: {e}")
 
 if __name__ == "__main__":
     main()
