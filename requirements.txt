@@ -1,10 +1,7 @@
-torch>=2.5.0
-torchvision==0.24.1
-torchaudio==2.0.1
-opencv-python-headless==4.7.0.72
-pandas==2.0.3
-scikit-image==0.21.0
-Pillow==10.1.0
-requests==2.31.0
-pytorch-lightning==2.0.9
-streamlit==1.25.0
+numpy==1.24.*
+opencv-python-headless==4.7.*
+Pillow==10.1.*
+torch==2.0.*
+torchvision==0.15.*
+pytorch-lightning==2.0.*
+streamlit==1.25.*
