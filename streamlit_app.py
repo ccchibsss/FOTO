@@ -8,17 +8,45 @@ import numpy as np
 from PIL import Image, ImageDraw
 import torch
 import subprocess
+import platform
 
 from lama_cleaner.model_manager import ModelManager
 from lama_cleaner.schema import Config, HDStrategy, LDMSampler
 from transformers import AutoProcessor, AutoModelForCausalLM
 
-# --- Установка зависимостей ---
+# --- Установка зависимостей и системных библиотек ---
 @st.cache(allow_output_mutation=True)
 def install_dependencies():
-    subprocess.run('pip install flash-attn --no-build-isolation', env={'FLASH_ATTENTION_SKIP_CUDA_BUILD': "TRUE"}, shell=True)
+    system = platform.system()
+    if system == "Linux":
+        # Для Linux
+        try:
+            subprocess.run('apt-get update', shell=True, check=True)
+            subprocess.run('apt-get install -y libgl1-mesa-glx', shell=True, check=True)
+        except Exception:
+            # Можно логировать ошибку или показывать сообщение
+            pass
+    elif system == "Windows":
+        # Для Windows
+        st.info(
+            "На Windows рекомендуется обновить драйвер видеокарты и установить последние версии DirectX "
+            "для корректной работы. Обновите драйверы видеокарты через сайт производителя."
+        )
+    else:
+        # Для других систем (macOS и т.п.) — ничего не делаем
+        pass
 
-# --- Модульная инициализация ---
+    # Установка Python-библиотек
+    try:
+        subprocess.run('pip install flash-attn --no-build-isolation', env={'FLASH_ATTENTION_SKIP_CUDA_BUILD': "TRUE"}, shell=True, check=True)
+    except subprocess.CalledProcessError:
+        # Можно логировать ошибку или показывать сообщение
+        pass
+
+# Вызываем установку один раз при запуске
+install_dependencies()
+
+# --- Классы моделей ---
 class FlorenceModel:
     def __init__(self, model_id):
         self.model_id = model_id
@@ -95,19 +123,17 @@ class WatermarkRemover:
         result_pil.save(output_path)
         return output_path
 
-# --- Основная функция запуска ---
+# --- Основная логика ---
 def main():
-    # Установка зависимостей
-    install_dependencies()
-
-    # Инициализация моделей
-    model_choices = available_models = [
+    # Модельные опции
+    model_choices = [
         'microsoft/Florence-2-base',
         'microsoft/Florence-2-base-ft',
         'microsoft/Florence-2-large',
         'microsoft/Florence-2-large-ft'
     ]
 
+    # Кеш моделей
     models_cache = {}
     for m_id in model_choices:
         models_cache[m_id] = FlorenceModel(m_id)
@@ -130,14 +156,13 @@ def main():
             uploaded_file.seek(0)
             temp_input.write(uploaded_file.read())
 
-        # Создаем объект для обработки
         remover = get_remover(selected_model_id)
 
         # Отображение загруженного изображения
         original_img = Image.open(input_path)
         st.image(original_img, caption='Загруженное изображение', use_column_width=True)
 
-        # Обработка по нажатию
+        # Обработка по кнопке
         if st.button("Удалить водяной знак"):
             with st.spinner('Обработка изображения...'):
                 try:
@@ -157,7 +182,7 @@ def main():
                 pass
         st.on_event("close", cleanup)
 
-    # --- Batch обработка ---
+    # --- Пакетная обработка ---
     st.write("---")
     st.subheader("Пакетная обработка папки")
     folder_path = st.text_input("Путь к папке с изображениями")
