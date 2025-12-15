@@ -1,4 +1,4 @@
-name: CI/CD Workflow
+name: CI/CD Pipeline for Streamlit App
 
 on:
   push:
@@ -9,8 +9,8 @@ on:
       - main
 
 jobs:
-  build-and-run:
-    name: Build, Test, and Run
+  build-and-test:
+    name: Build, Test, and Deploy
     runs-on: ubuntu-latest
 
     steps:
@@ -32,13 +32,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Streamlit app
+      - name: Lint code
         run: |
-          # Запускаем Streamlit в фоновом режиме
-          nohup streamlit run streamlit_app.py > streamlit.log 2>&1 &
-          
-          # Можно добавить задержку, чтобы убедиться, что приложение запустилось
+          pip install flake8
+          flake8 streamlit_app.py
+
+      - name: Run tests
+        run: |
+          # Предположим, у вас есть тесты в tests/ или внутри файла
+          # Для примера — запуск тестов с pytest
+          pip install pytest
+          pytest tests/
+
+      - name: Start Streamlit app in background
+        run: |
+          nohup streamlit run streamlit_app.py --server.port=8501 > streamlit.log 2>&1 &
           sleep 10
-          
-          # Вывод логов для проверки
-          tail -n 20 streamlit.log
+
+      - name: Check if Streamlit app is running
+        run: |
+          curl -s --fail http://localhost:8501 || exit 1
+
+      - name: Upload logs for debugging
+        if: failure()
+        run: |
+          tail -n 50 streamlit.log
