@@ -1,8 +1,8 @@
-streamlit==1.38.0
-Pillow==10.2.0
-numpy==1.26.4
-opencv-python-headless==4.9.0.80
-torch==2.3.0
-transformers==4.40.0
-lama-cleaner==0.4.2
-onnxruntime-gpu==1.18.0  # или onnxruntime==1.18.0
+streamlit>=1.38.0
+Pillow>=10.2.0
+numpy>=1.26.4
+opencv-python-headless>=4.9.0.80
+torch>=2.3.0  # Не указывайте точную версию!
+transformers>=4.40.0
+lama-cleaner>=0.4.2
+onnxruntime-gpu>=1.18.0  # Или onnxruntime
