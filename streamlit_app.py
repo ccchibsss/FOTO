@@ -23,14 +23,14 @@ from PIL import Image
 import numpy as np
 import cv2
 
-# Try to import streamlit; если нет — работаем в CLI режиме
+# Try to импортировать streamlit; если нет — работаем в CLI режиме
 try:
     import streamlit as st  # type: ignore
     ST_AVAILABLE = True
 except Exception:
     ST_AVAILABLE = False
 
-# Try to import user lightning model (optional)
+# Попытка импортировать пользовательскую модель lightning_module
 try:
     from lightning_module import WatermarkDetection  # user model
     LIGHTNING_AVAILABLE = True
@@ -43,12 +43,12 @@ logging.basicConfig(level=logging.INFO, filename="watermark_app.log",
 logger = logging.getLogger(__name__)
 
 
-# ----------------- Utilities / Fallbacks -----------------
+# ----------------- Утилиты / Запасные методы -----------------
 def open_image(file_or_path) -> Image.Image:
-    """Open a PIL image from a path or file-like (Streamlit uploader)."""
+    """Открывает PIL изображение из пути или файла."""
     if isinstance(file_or_path, str):
         return Image.open(file_or_path).convert("RGB")
-    # file-like: ensure pointer at start
+    # файл-подобный объект
     try:
         file_or_path.seek(0)
     except Exception:
@@ -63,7 +63,7 @@ def pil_to_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
 
 
 def detect_watermark_mask_cv(image_cv: np.ndarray) -> np.ndarray:
-    """Heuristic mask detection used in fallback (single-channel 0/255)."""
+    """Гистерезисное обнаружение маски при помощи OpenCV."""
     gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
     blur = cv2.medianBlur(gray, 25)
     diff = cv2.absdiff(gray, blur)
@@ -73,7 +73,7 @@ def detect_watermark_mask_cv(image_cv: np.ndarray) -> np.ndarray:
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.dilate(mask, kernel, iterations=1)
-    # remove tiny components
+    # Удаление мелких компонентов
     nb, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     min_area = (image_cv.shape[0] * image_cv.shape[1]) * 0.0005
     out = np.zeros_like(mask)
@@ -84,7 +84,7 @@ def detect_watermark_mask_cv(image_cv: np.ndarray) -> np.ndarray:
 
 
 def inpaint_image_cv(image_cv: np.ndarray, mask_cv: np.ndarray, method: str = "telea") -> np.ndarray:
-    """Inpaint masked regions. mask should be single-channel 0/255."""
+    """Inpaint изображение по маске."""
     if mask_cv.ndim == 3:
         mask = cv2.cvtColor(mask_cv, cv2.COLOR_BGR2GRAY)
     else:
@@ -100,13 +100,9 @@ def inpaint_image_cv(image_cv: np.ndarray, mask_cv: np.ndarray, method: str = "t
         return out
 
 
-# ----------------- preprocess_image and show_result (original utils
-# replacements) -----------------
+# ----------------- подготовка изображений и отображение -----------------
 def preprocess_image(file_or_path) -> np.ndarray:
-    """
-    Возвращает изображение как numpy array в RGB (H, W, C).
-    Принимает путь или file-like (Streamlit uploader).
-    """
+    """Возвращает изображение как numpy массив (RGB)."""
     img = open_image(file_or_path)
     arr = np.array(img)  # RGB
     return arr
@@ -114,10 +110,7 @@ def preprocess_image(file_or_path) -> np.ndarray:
 
 def show_result(original: np.ndarray, cleaned: np.ndarray, title_original: str = "Original",
                 title_cleaned: str = "Cleaned"):
-    """
-    Показывает результат либо в Streamlit, либо сохраняет файл в CLI.
-    Возвращает bytes результата (PNG) для скачивания в Streamlit.
-    """
+    """Показывает результат либо в Streamlit, либо сохраняет файл в CLI."""
     orig_pil = Image.fromarray(original)
     clean_pil = Image.fromarray(cleaned)
     if ST_AVAILABLE:
@@ -126,14 +119,13 @@ def show_result(original: np.ndarray, cleaned: np.ndarray, title_original: str =
         col2.image(clean_pil, caption=title_cleaned, use_column_width=True)
         return pil_to_bytes(clean_pil, fmt="PNG")
     else:
-        # В CLI просто сохраняем временный файл и печатаем путь
-        out = Path(tempfile_filename("cleaned_"))  # defined below
+        # В CLI сохранить файл и вывести путь
+        out = Path(tempfile_filename("cleaned_"))  # определено ниже
         clean_pil.save(out, format="PNG")
-        print("Saved cleaned image to:", out)
+        print("Сохранено изображение:", out)
         return None
 
 
-# helper to create a temp filename
 def tempfile_filename(prefix: str = "tmp_", suffix: str = ".png") -> str:
     import tempfile
     fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix)
@@ -141,12 +133,9 @@ def tempfile_filename(prefix: str = "tmp_", suffix: str = ".png") -> str:
     return path
 
 
-# ----------------- Model wrapper / fallback -----------------
+# ----------------- модель и fallback -----------------
 class WatermarkDetectionFallback:
-    """
-    Простая замена модели: детектирует маску эвристикой и делает inpainting.
-    Метод remove_watermark принимает numpy array RGB и возвращает RGB numpy array.
-    """
+    """Простая модель-заглушка - детекция маски эвристикой и inpainting."""
     def remove_watermark(self, image_rgb: np.ndarray) -> np.ndarray:
         image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
         mask = detect_watermark_mask_cv(image_bgr)
@@ -156,41 +145,37 @@ class WatermarkDetectionFallback:
 
 
 def load_model_checkpoint(checkpoint_path: str) -> object:
-    """
-    Попытка загрузить модель из lightning_module.WatermarkDetection.
-    Если не удалось — возвращаем fallback-объект.
-    """
+    """Пытается загрузить модель, иначе использует fallback."""
     if LIGHTNING_AVAILABLE and WatermarkDetection is not None:
         try:
-            # Поддерживаем как класс с методом load_from_checkpoint, так и простой конструктор
             if hasattr(WatermarkDetection, "load_from_checkpoint"):
-                logger.info("Loading WatermarkDetection from checkpoint: %s", checkpoint_path)
+                logger.info("Загрузка модели из чекпоинта: %s", checkpoint_path)
                 return WatermarkDetection.load_from_checkpoint(checkpoint_path=checkpoint_path)
             else:
-                logger.info("Instantiating WatermarkDetection() without checkpoint")
+                logger.info("Создание экземпляра модели без чекпоинта")
                 return WatermarkDetection()
         except Exception as e:
-            logger.warning("Failed to load WatermarkDetection checkpoint: %s. Using fallback. (%s)", checkpoint_path, e)
+            logger.warning("Не удалось загрузить чекпоинт: %s. Используем fallback. (%s)", checkpoint_path, e)
     else:
-        logger.info("Lightning model not available, using fallback.")
+        logger.info("Модель Lightning недоступна, используем fallback.")
     return WatermarkDetectionFallback()
 
 
-# ----------------- Streamlit app -----------------
+# ----------------- интерфейс Streamlit -----------------
 def streamlit_app(checkpoint_path: str = "./checkpoints/best_model.ckpt"):
     st.title("Watermark Removal App")
     st.write("Загрузите изображение — приложение попытается удалить водяной знак.")
     uploaded_file = st.file_uploader("Загрузите изображение:", type=["jpg", "jpeg", "png"])
 
     if uploaded_file is not None:
-        original_arr = preprocess_image(uploaded_file)  # RGB numpy
+        original_arr = preprocess_image(uploaded_file)
         with st.spinner("Загрузка модели и обработка..."):
             model = load_model_checkpoint(checkpoint_path)
             try:
                 cleaned = model.remove_watermark(original_arr)
             except Exception as e:
-                logger.exception("Model processing failed: %s", e)
-                st.error(f"Ошибка при обработке модели: {e}\nПопытка fallback-обработки.")
+                logger.exception("Ошибка при обработке модели: %s", e)
+                st.error(f"Ошибка при обработке модели: {e}\nИспользуем fallback-метод.")
                 cleaned = WatermarkDetectionFallback().remove_watermark(original_arr)
 
         png_bytes = show_result(original_arr, cleaned)
@@ -198,25 +183,25 @@ def streamlit_app(checkpoint_path: str = "./checkpoints/best_model.ckpt"):
             st.download_button("Скачать результат", data=png_bytes, file_name="cleaned.png", mime="image/png")
 
 
-# ----------------- CLI functionality -----------------
+# ----------------- CLI функции -----------------
 def cli_single(input_path: str, output_path: str, checkpoint: Optional[str] = None):
     arr = preprocess_image(input_path)
     model = load_model_checkpoint(checkpoint or "./checkpoints/best_model.ckpt")
     try:
         cleaned = model.remove_watermark(arr)
     except Exception as e:
-        logger.exception("Model processing failed, using fallback: %s", e)
+        logger.exception("Обработка не удалась, fallback: %s", e)
         cleaned = WatermarkDetectionFallback().remove_watermark(arr)
     result_pil = Image.fromarray(cleaned)
     ensure_parent_dir(output_path)
     result_pil.save(output_path, format="PNG")
-    print("Saved:", output_path)
+    print("Сохранено:", output_path)
 
 
 def cli_batch(input_folder: str, output_folder: str, workers: int = 4, checkpoint: Optional[str] = None):
     files = [p for p in Path(input_folder).iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg"}]
     if not files:
-        print("No images found in", input_folder)
+        print("Нет изображений в папке", input_folder)
         return
     model = load_model_checkpoint(checkpoint or "./checkpoints/best_model.ckpt")
     ensure_parent_dir(output_folder)
@@ -230,9 +215,9 @@ def cli_batch(input_folder: str, output_folder: str, workers: int = 4, checkpoin
             src, dst = futures[fut]
             try:
                 fut.result()
-                print("Processed:", src, "->", dst)
+                print("Обработано:", src, "->", dst)
             except Exception as e:
-                print("Failed:", src, ":", e)
+                print("Ошибка при обработке:", src, ":", e)
 
 
 def process_one_file(src_path: Path, dst_path: str, model_obj):
@@ -249,25 +234,24 @@ def ensure_parent_dir(path: str):
     os.makedirs(d, exist_ok=True)
 
 
-# ----------------- Entrypoint -----------------
+# ----------------- точка входа -----------------
 def main():
-    parser = argparse.ArgumentParser(description="Watermark Removal App (Streamlit UI or CLI fallback)")
+    parser = argparse.ArgumentParser(description="Watermark Removal App (Streamlit UI или CLI fallback)")
     sub = parser.add_subparsers(dest="cmd")
 
-    p_single = sub.add_parser("single", help="Process single image")
-    p_single.add_argument("input", help="Input image path")
-    p_single.add_argument("output", help="Output image path")
-    p_single.add_argument("--checkpoint", help="Path to model checkpoint", default="./checkpoints/best_model.ckpt")
+    p_single = sub.add_parser("single", help="Обработать одно изображение")
+    p_single.add_argument("input", help="Путь к изображению")
+    p_single.add_argument("output", help="Путь для сохранения результата")
+    p_single.add_argument("--checkpoint", help="Путь к чекпоинту модели", default="./checkpoints/best_model.ckpt")
 
-    p_batch = sub.add_parser("batch", help="Process folder")
-    p_batch.add_argument("input_folder", help="Input folder")
-    p_batch.add_argument("output_folder", help="Output folder")
+    p_batch = sub.add_parser("batch", help="Обработка папки")
+    p_batch.add_argument("input_folder", help="Папка с изображениями")
+    p_batch.add_argument("output_folder", help="Папка для сохранения результатов")
     p_batch.add_argument("--workers", type=int, default=4)
-    p_batch.add_argument("--checkpoint", help="Path to model checkpoint", default="./checkpoints/best_model.ckpt")
+    p_batch.add_argument("--checkpoint", help="Путь к чекпоинту модели", default="./checkpoints/best_model.ckpt")
 
-    # If Streamlit present and no CLI args, run Streamlit UI
+    # Если есть streamlit и нет аргументов — запустить UI
     if ST_AVAILABLE and len(sys.argv) == 1:
-        # Note: when running `streamlit run script.py`, streamlit provides args; this branch works for direct python run.
         streamlit_app()
         return
 
