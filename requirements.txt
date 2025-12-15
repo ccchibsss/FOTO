@@ -1,8 +1,15 @@
-streamlit>=1.38.0
-Pillow>=10.2.0
-numpy>=1.26.4
-opencv-python-headless>=4.9.0.80
-torch>=2.3.0  # Не указывайте точную версию!
-transformers>=4.40.0
-lama-cleaner>=0.4.2
-onnxruntime-gpu>=1.18.0  # Или onnxruntime
+streamlit==1.25.*
+pytorch-lightning==2.0.*
+torchvision==0.15.*
+pillow==9.5.*  # Библиотека для работы с изображениями
+opencv-python-headless==4.7.*  # Для обработки изображений
+numpy==1.24.*  # Массивы NumPy
+scipy==1.10.*  # Научные расчеты
+scikit-image==0.21.*  # Инструменты обработки изображений
+onnxruntime==1.15.*  # Для работы с YOLO
+torch==2.0.*+cu118  # Версия Torch с поддержкой CUDA (если GPU доступен)
+torchaudio==2.0.*  # Аудиотрансформации (при необходимости)
+tqdm==4.65.*  # Индикатор прогресса
+pandas==2.0.*  # Анализ данных (при необходимости)
+requests==2.31.*  # HTTP-запросы (при необходимости)
+pytest==7.4.*  # Unit-тесты (при необходимости)
