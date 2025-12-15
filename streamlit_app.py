@@ -1,15 +1,5 @@
 # fixed_watermark_app.py
-# Исправлённая и надёжная версия вашего приложения.
-# - Работает в Streamlit (если установлен) или в CLI режиме.
-# - Поддерживает загрузку реальной модели WatermarkDetection из
-# lightning_module,
-# если она доступна и есть чекпоинт.
-# - Если модели нет, использует fallback-метод на OpenCV inpainting.
-# Запуск:
-# - Streamlit: streamlit run fixed_watermark_app.py
-# - CLI single: python fixed_watermark_app.py single input.jpg output.png
-# - CLI batch : python fixed_watermark_app.py batch /in/folder /out/folder
-# --workers 4
+# Обновлённая и улучшенная версия вашего приложения для удаления водяных знаков.
 
 import os
 import sys
@@ -23,16 +13,16 @@ from PIL import Image
 import numpy as np
 import cv2
 
-# Try to импортировать streamlit; если нет — работаем в CLI режиме
+# Попытка импортировать streamlit
 try:
     import streamlit as st  # type: ignore
     ST_AVAILABLE = True
 except Exception:
     ST_AVAILABLE = False
 
-# Попытка импортировать пользовательскую модель lightning_module
+# Попытка импортировать Lightning модель
 try:
-    from lightning_module import WatermarkDetection  # user model
+    from lightning_module import WatermarkDetection
     LIGHTNING_AVAILABLE = True
 except Exception:
     WatermarkDetection = None
@@ -43,12 +33,11 @@ logging.basicConfig(level=logging.INFO, filename="watermark_app.log",
 logger = logging.getLogger(__name__)
 
 
-# ----------------- Утилиты / Запасные методы -----------------
+# ----------------- Утилиты -----------------
 def open_image(file_or_path) -> Image.Image:
-    """Открывает PIL изображение из пути или файла."""
+    """Открывает изображение PIL из файла или байтов."""
     if isinstance(file_or_path, str):
         return Image.open(file_or_path).convert("RGB")
-    # файл-подобный объект
     try:
         file_or_path.seek(0)
     except Exception:
@@ -63,19 +52,20 @@ def pil_to_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
 
 
 def detect_watermark_mask_cv(image_cv: np.ndarray) -> np.ndarray:
-    """Гистерезисное обнаружение маски при помощи OpenCV."""
+    """Обнаружение маски водяного знака с улучшениями."""
     gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
-    blur = cv2.medianBlur(gray, 25)
-    diff = cv2.absdiff(gray, blur)
-    m, s = diff.mean(), diff.std()
-    thr = int(max(8, m + 0.7 * s))
-    _, mask = cv2.threshold(diff, thr, 255, cv2.THRESH_BINARY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    # Используем адаптивную пороговую обработку для выделения водяных знаков
+    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 11, 2)
+    # Размытие для сглаживания
+    blurred = cv2.GaussianBlur(thresh, (5, 5), 0)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(blurred, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.dilate(mask, kernel, iterations=1)
+
     # Удаление мелких компонентов
     nb, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    min_area = (image_cv.shape[0] * image_cv.shape[1]) * 0.0005
+    min_area = (image_cv.shape[0] * image_cv.shape[1]) * 0.0003
     out = np.zeros_like(mask)
     for i in range(1, nb):
         if stats[i, cv2.CC_STAT_AREA] >= min_area:
@@ -84,33 +74,41 @@ def detect_watermark_mask_cv(image_cv: np.ndarray) -> np.ndarray:
 
 
 def inpaint_image_cv(image_cv: np.ndarray, mask_cv: np.ndarray, method: str = "telea") -> np.ndarray:
-    """Inpaint изображение по маске."""
+    """Inpainting с параметрами и сглаживанием."""
     if mask_cv.ndim == 3:
         mask = cv2.cvtColor(mask_cv, cv2.COLOR_BGR2GRAY)
     else:
         mask = mask_cv
     mask_bin = (mask > 0).astype("uint8") * 255
     flag = cv2.INPAINT_TELEA if method == "telea" else cv2.INPAINT_NS
+    radius = 5  # Можно увеличить радиус для более "гладкого" результата
     try:
-        return cv2.inpaint(image_cv, mask_bin, 3, flag)
+        inpainted = cv2.inpaint(image_cv, mask_bin, radius, flag)
     except Exception:
-        blurred = cv2.GaussianBlur(image_cv, (21, 21), 0)
-        out = image_cv.copy()
-        out[mask_bin == 255] = blurred[mask_bin == 255]
-        return out
+        # В случае ошибки — простое размытие
+        inpainted = cv2.GaussianBlur(image_cv, (21, 21), 0)
+        inpainted[mask_bin == 255] = inpainted[mask_bin == 255]
+    # Применяем сглаживание
+    smoothed = cv2.GaussianBlur(inpainted, (5, 5), 0)
+    return smoothed
 
 
-# ----------------- подготовка изображений и отображение -----------------
+def smoothen_image(image: np.ndarray) -> np.ndarray:
+    """Дополнительное сглаживание."""
+    return cv2.GaussianBlur(image, (5, 5), 0)
+
+
+# ----------------- подготовка изображений -----------------
 def preprocess_image(file_or_path) -> np.ndarray:
-    """Возвращает изображение как numpy массив (RGB)."""
+    """Возвращает изображение как numpy RGB-массив."""
     img = open_image(file_or_path)
-    arr = np.array(img)  # RGB
+    arr = np.array(img)
     return arr
 
 
 def show_result(original: np.ndarray, cleaned: np.ndarray, title_original: str = "Original",
                 title_cleaned: str = "Cleaned"):
-    """Показывает результат либо в Streamlit, либо сохраняет файл в CLI."""
+    """Показ результата в Streamlit или сохранение файла в CLI."""
     orig_pil = Image.fromarray(original)
     clean_pil = Image.fromarray(cleaned)
     if ST_AVAILABLE:
@@ -119,10 +117,9 @@ def show_result(original: np.ndarray, cleaned: np.ndarray, title_original: str =
         col2.image(clean_pil, caption=title_cleaned, use_column_width=True)
         return pil_to_bytes(clean_pil, fmt="PNG")
     else:
-        # В CLI сохранить файл и вывести путь
-        out = Path(tempfile_filename("cleaned_"))  # определено ниже
-        clean_pil.save(out, format="PNG")
-        print("Сохранено изображение:", out)
+        out_path = Path(tempfile_filename("cleaned_"))
+        clean_pil.save(out_path, format="PNG")
+        print("Сохранено изображение:", out_path)
         return None
 
 
@@ -135,7 +132,7 @@ def tempfile_filename(prefix: str = "tmp_", suffix: str = ".png") -> str:
 
 # ----------------- модель и fallback -----------------
 class WatermarkDetectionFallback:
-    """Простая модель-заглушка - детекция маски эвристикой и inpainting."""
+    """Заглушка — эвристика и inpainting."""
     def remove_watermark(self, image_rgb: np.ndarray) -> np.ndarray:
         image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
         mask = detect_watermark_mask_cv(image_bgr)
@@ -145,19 +142,19 @@ class WatermarkDetectionFallback:
 
 
 def load_model_checkpoint(checkpoint_path: str) -> object:
-    """Пытается загрузить модель, иначе использует fallback."""
+    """Загрузка модели или fallback."""
     if LIGHTNING_AVAILABLE and WatermarkDetection is not None:
         try:
             if hasattr(WatermarkDetection, "load_from_checkpoint"):
-                logger.info("Загрузка модели из чекпоинта: %s", checkpoint_path)
+                logger.info("Загрузка из чекпоинта: %s", checkpoint_path)
                 return WatermarkDetection.load_from_checkpoint(checkpoint_path=checkpoint_path)
             else:
-                logger.info("Создание экземпляра модели без чекпоинта")
+                logger.info("Создание модели без чекпоинта")
                 return WatermarkDetection()
         except Exception as e:
             logger.warning("Не удалось загрузить чекпоинт: %s. Используем fallback. (%s)", checkpoint_path, e)
     else:
-        logger.info("Модель Lightning недоступна, используем fallback.")
+        logger.info("Модель недоступна, fallback.")
     return WatermarkDetectionFallback()
 
 
@@ -174,8 +171,8 @@ def streamlit_app(checkpoint_path: str = "./checkpoints/best_model.ckpt"):
             try:
                 cleaned = model.remove_watermark(original_arr)
             except Exception as e:
-                logger.exception("Ошибка при обработке модели: %s", e)
-                st.error(f"Ошибка при обработке модели: {e}\nИспользуем fallback-метод.")
+                logger.exception("Ошибка модели: %s", e)
+                st.error(f"Ошибка модели: {e}\nИспользуем fallback-метод.")
                 cleaned = WatermarkDetectionFallback().remove_watermark(original_arr)
 
         png_bytes = show_result(original_arr, cleaned)
@@ -189,8 +186,7 @@ def cli_single(input_path: str, output_path: str, checkpoint: Optional[str] = No
     model = load_model_checkpoint(checkpoint or "./checkpoints/best_model.ckpt")
     try:
         cleaned = model.remove_watermark(arr)
-    except Exception as e:
-        logger.exception("Обработка не удалась, fallback: %s", e)
+    except Exception:
         cleaned = WatermarkDetectionFallback().remove_watermark(arr)
     result_pil = Image.fromarray(cleaned)
     ensure_parent_dir(output_path)
